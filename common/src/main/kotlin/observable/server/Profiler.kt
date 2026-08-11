@@ -1,5 +1,4 @@
 package observable.server
-
 import dev.architectury.utils.GameInstance
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -10,6 +9,7 @@ import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.level.Level
+import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.entity.TickingBlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.material.FluidState
@@ -19,29 +19,28 @@ import observable.net.S2CPacket
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.GZIPOutputStream
 import kotlin.concurrent.schedule
 import kotlin.random.Random
-
 inline val StackTraceElement.classMethod
     get() = "${this.className} + ${this.methodName}"
 
 class Profiler {
     data class TimingData(
-        var time: Long,
-        var ticks: Int,
+        @Volatile var time: Long,
+        @Volatile var ticks: Int,
         var traces: TraceMap,
-        var name: String = ""
+        @Volatile var name: String = ""
     )
 
     var timingsMap = HashMap<Entity, TimingData>()
     lateinit var serverTraceMap: TraceMap
     lateinit var serverThread: Thread
     lateinit var samplerThread: Thread
-
     // TODO: consider splitting out block entity timings
     //    var blockEntityTimingsMap = HashMap<BlockEntity, TimingData>()
-    var blockTimingsMap = HashMap<ResourceKey<Level>, HashMap<BlockPos, TimingData>>()
+    var blockTimingsMap = ConcurrentHashMap<ResourceKey<Level>, ConcurrentHashMap<BlockPos, TimingData>>()
     var notProcessing
         get() = Props.notProcessing
         set(v) {
@@ -51,14 +50,14 @@ class Profiler {
     var player: ServerPlayer? = null
     var startTime: Long = 0
     var startingTicks: Int = 0
-
+    @Volatile var lastCompletedTicks: Int = 0
     fun process(entity: Entity) =
         timingsMap.getOrPut(entity) { TimingData(0, 0, TraceMap(entity::class)) }
 
     fun processBlockEntity(blockEntity: TickingBlockEntity, level: Level) =
         blockTimingsMap
-            .getOrPut(level.dimension()) { HashMap() }
-            .getOrPut(blockEntity.pos) {
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(blockEntity.pos) {
                 TimingData(
                     0,
                     0,
@@ -67,10 +66,59 @@ class Profiler {
                 )
             }
 
+    fun processCompatBlockEntity(blockEntity: BlockEntity, level: Level, name: String): TimingData {
+        val data = blockTimingsMap
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(blockEntity.blockPos) {
+                TimingData(
+                    0,
+                    0,
+                    TraceMap(blockEntity::class),
+                    name
+                )
+            }
+
+        // AE2 parts live inside an ae2:cable_bus BlockEntity. If a vanilla
+        // BlockEntity tick created the entry first, keep the same timing bucket
+        // but replace the generic cable-bus name with the actual part item id.
+        if (name.isNotBlank()) {
+            val blockName = BuiltInRegistries.BLOCK.getKey(blockEntity.blockState.block).toString()
+            if (data.name.isBlank() || data.name == blockName || data.name == blockEntity.blockState.block.descriptionId) {
+                data.name = name
+            }
+        }
+
+        return data
+    }
+
+    /**
+     * Adds a synthetic timing point used by optional compatibility profilers.
+     * The position is intentionally not required to contain a real block; the
+     * client already renders block timings by dimension + BlockPos.
+     */
+    fun processCompatVirtualBlock(level: Level, pos: BlockPos, name: String): TimingData {
+        val data = blockTimingsMap
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(pos) {
+                TimingData(
+                    0,
+                    0,
+                    TraceMap(),
+                    name
+                )
+            }
+
+        if (name.isNotBlank() && (data.name.isBlank() || data.name.startsWith("AE2 Grid"))) {
+            data.name = name
+        }
+
+        return data
+    }
+
     fun processBlock(blockState: BlockState, pos: BlockPos, level: Level) =
         blockTimingsMap
-            .getOrPut(level.dimension()) { HashMap() }
-            .getOrPut(pos) {
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(pos) {
                 TimingData(
                     0,
                     0,
@@ -78,11 +126,10 @@ class Profiler {
                     blockState.block.descriptionId
                 )
             }
-
     fun processFluid(fluidState: FluidState, pos: BlockPos, level: Level) =
         blockTimingsMap
-            .getOrPut(level.dimension()) { HashMap() }
-            .getOrPut(pos) {
+            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(pos) {
                 TimingData(
                     0,
                     0,
@@ -90,20 +137,27 @@ class Profiler {
                     BuiltInRegistries.FLUID.getKey(fluidState.type).toString()
                 )
             }
-
     fun startRunning(sample: Boolean = false) {
         timingsMap.clear()
         blockTimingsMap.clear()
         serverTraceMap = TraceMap()
         startTime = System.currentTimeMillis()
+        lastCompletedTicks = 0
         synchronized(Props.notProcessing) {
             notProcessing = false
             startingTicks = GameInstance.getServer()!!.tickCount
         }
+        // Loader-specific compatibility profilers must reset at the exact same
+        // session boundary. In particular, do not poll startTime from worker
+        // threads: it is not a synchronization primitive.
+        try {
+            Props.compatProfilerStartHook?.run()
+        } catch (t: Throwable) {
+            Observable.LOGGER.warn("Compatibility profiler start hook failed", t)
+        }
         if (sample) {
             samplerThread = Thread(TaggedSampler(serverThread))
             samplerThread.start()
-
             Thread {
                 while (!Props.notProcessing) {
                     val interval = ServerSettings.traceInterval.toLong()
@@ -115,7 +169,6 @@ class Profiler {
                 .start()
         }
     }
-
     fun runWithDuration(
         player: ServerPlayer?,
         duration: Int,
@@ -132,6 +185,35 @@ class Profiler {
             stopRunning()
         }
     }
+    /**
+     * ProfilingData stores an average rate as time / sample-count. Compatibility
+     * collectors may intentionally create a zero-cost bucket (for example an
+     * idle ME Drive that should still be visible in the result). A 0 / 0 bucket
+     * becomes NaN and kotlinx.serialization correctly refuses to emit it as
+     * JSON. Convert only unsampled buckets to one synthetic zero-cost sample so
+     * their exported rate is exactly 0.0 while preserving every real sample.
+     */
+    private fun normalizeZeroSampleTimingsForExport(): Int {
+        var normalized = 0
+
+        fun normalize(data: TimingData) {
+            if (data.ticks > 0) return
+            synchronized(data) {
+                if (data.ticks <= 0) {
+                    // A negative time is never a valid timing sample either.
+                    if (data.time < 0L) data.time = 0L
+                    data.ticks = 1
+                    normalized++
+                }
+            }
+        }
+
+        timingsMap.values.forEach(::normalize)
+        blockTimingsMap.values.forEach { dimension ->
+            dimension.values.forEach(::normalize)
+        }
+        return normalized
+    }
 
     fun uploadProfile(data: ProfilingData, diagnostics: JsonObject): String? {
         if (ServerSettings.uploadURL.isEmpty()) {
@@ -140,9 +222,11 @@ class Profiler {
         }
 
         Observable.LOGGER.info("Attempting to upload profile")
-        val serialized = Json.encodeToString(DataWithDiagnostics(data, diagnostics))
-
         return try {
+            // Keep serialization inside the fail-soft boundary. A malformed
+            // optional timing can no longer kill the Profiler timer thread and
+            // prevent the compact in-game result from being delivered.
+            val serialized = Json.encodeToString(DataWithDiagnostics(data, diagnostics))
             val conn = URL(ServerSettings.uploadURL).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
@@ -151,7 +235,6 @@ class Profiler {
             GZIPOutputStream(conn.outputStream).bufferedWriter(Charsets.UTF_8).use {
                 it.write(serialized)
             }
-
             val profileURL = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             Observable.LOGGER.info("Profile uploaded to $profileURL")
 
@@ -161,21 +244,48 @@ class Profiler {
             null
         }
     }
-
     fun stopRunning() {
         val diagnostics = getDiagnostics()
         val ticks: Int
         synchronized(Props.notProcessing) {
             notProcessing = true
             ticks = GameInstance.getServer()!!.tickCount - startingTicks
+            lastCompletedTicks = ticks
+        }
+        // Freeze optional compatibility collectors before ProfilingData snapshots
+        // the maps. This lets them publish synthetic entries once, atomically,
+        // instead of mutating virtual block buckets throughout the run.
+        try {
+            Props.compatProfilerSnapshotHook?.run()
+        } catch (t: Throwable) {
+            Observable.LOGGER.warn("Compatibility profiler snapshot hook failed", t)
         }
         val players = player?.let { listOf(it) } ?: listOf()
         Observable.CHANNEL.sendToPlayers(players, S2CPacket.ProfilingCompleted)
-        val data = ProfilingData.create(timingsMap, blockTimingsMap, ticks, serverTraceMap)
+        // Keep the complete snapshot (including diagnostic-only compatibility
+        // markers) for the local report and observable.tas.sh upload. Before
+        // ProfilingData calculates average rates, make intentionally passive
+        // zero-cost buckets JSON-safe (0 ns / 1 synthetic sample => 0.0 rate).
+        // This is especially important for visible-but-idle AE2 ME Drives.
+        val normalizedZeroSamples = normalizeZeroSampleTimingsForExport()
+        if (normalizedZeroSamples > 0) {
+            Observable.LOGGER.info(
+                "Normalized $normalizedZeroSamples zero-sample timing bucket(s) for JSON-safe export"
+            )
+        }
+        val uploadData = ProfilingData.create(timingsMap, blockTimingsMap, ticks, serverTraceMap)
         Observable.LOGGER.info("Profiler ran for $ticks ticks, sending data")
         Observable.LOGGER.info("Sending to ${players.map { it.gameProfile.name }}")
-        val link = uploadProfile(data, diagnostics)
-        Observable.CHANNEL.sendToPlayersSplit(players, S2CPacket.ProfilingResult(data, link))
+        val link = uploadProfile(uploadData, diagnostics)
+
+        try {
+            Props.compatProfilerClientViewHook?.run()
+        } catch (t: Throwable) {
+            Observable.LOGGER.warn("Compatibility profiler client-view hook failed", t)
+        }
+
+        val clientData = ProfilingData.create(timingsMap, blockTimingsMap, ticks, serverTraceMap)
+        Observable.CHANNEL.sendToPlayersSplit(players, S2CPacket.ProfilingResult(clientData, link))
         Observable.LOGGER.info("Data transfer complete!")
         GameInstance.getServer()
             ?.playerList

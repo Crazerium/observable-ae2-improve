@@ -15,6 +15,7 @@ loom {
 //        useFabricMixin = true
 
         mixinConfig "observable.common.json"
+        mixinConfig "observable.gt_odyssey_compat.json"
     }
 }
 
@@ -29,6 +30,8 @@ configurations {
 
 dependencies {
     forge "net.minecraftforge:forge:${rootProject.minecraft_version}-${rootProject.forge_version}"
+    // Compile-only ABI stub for AE2 Grid service dispatch. The real interface is provided by AE2 at runtime.
+    compileOnly files("compat-libs/ae2-grid-service-api-stub.jar")
     // Remove the next line if you don't want to depend on the API
     modApi "dev.architectury:architectury-forge:${rootProject.architectury_version}"
 
