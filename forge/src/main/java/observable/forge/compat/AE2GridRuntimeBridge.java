@@ -30,13 +30,19 @@ public final class AE2GridRuntimeBridge {
             CompatTiming.onAE2CompatSessionStart();
         };
 
-        // This hook runs before Observable snapshots/uploads the profile. It
-        // therefore materializes every diagnostic marker and writes the same
-        // counters to a standalone JSON report on disk.
+        // This hook runs before Observable snapshots/uploads the profile. Write the
+        // standalone report first, while blockTimingsMap still contains only real
+        // physical timing buckets. Virtual Grid markers are materialized afterwards
+        // for the normal Observable upload, so they cannot masquerade as a physical
+        // device when a reserved marker coordinate later collides with a real block.
         Props.compatProfilerSnapshotHook = () -> {
-            AE2GridProfiler.publishVirtualTimings();
-            Profiler profiler = Observable.INSTANCE.getPROFILER();
-            AE2GridProfiler.writeDetailedReport(profiler.getLastCompletedTicks());
+            try {
+                Profiler profiler = Observable.INSTANCE.getPROFILER();
+                AE2GridProfiler.writeDetailedReport(profiler.getLastCompletedTicks());
+                AE2GridProfiler.publishVirtualTimings();
+            } finally {
+                CompatTiming.onAE2CompatSessionEnd();
+            }
         };
 
         // The upload above already captured the full diagnostic profile. Before
@@ -44,6 +50,6 @@ public final class AE2GridRuntimeBridge {
         // tower and leave only one inclusive total marker per grid.
         Props.compatProfilerClientViewHook = AE2GridProfiler::prepareClientOverlay;
 
-        LOGGER.info("Observable AE2 Grid profiler bridge enabled (v20.1 duplicate-anchor-safe Compare + dual-view dashboard + moderator TP)");
+        LOGGER.info("Observable AE2 Grid profiler bridge enabled (v20.3.2.7 Typed Cell Owner Resolution + Drive Owner Mapping + Drive Coverage Diagnostics + Profiler Correctness + Large Server Safety + Distribution Modes + report retention + Operation-aware Spike Analysis + Current Diagnosis + Regression Intelligence + duplicate-anchor-safe Compare + moderator TP)");
     }
 }

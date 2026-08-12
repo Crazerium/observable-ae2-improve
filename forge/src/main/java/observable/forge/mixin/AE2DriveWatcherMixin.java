@@ -17,19 +17,29 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Pseudo
 @Mixin(targets = "appeng.me.storage.DriveWatcher", remap = false)
 public abstract class AE2DriveWatcherMixin {
-    @Inject(method = {"insert", "extract"}, at = @At("HEAD"), require = 0)
-    private void observable$beginTransfer(CallbackInfoReturnable<Long> cir) {
-        CompatTiming.beginAE2DriveOperation(this);
+    @Inject(method = "insert", at = @At("HEAD"), require = 0)
+    private void observable$beginInsert(CallbackInfoReturnable<Long> cir) {
+        CompatTiming.beginAE2DriveOperation(this, "drive.insert");
     }
 
-    @Inject(method = {"insert", "extract"}, at = @At("RETURN"), require = 0)
-    private void observable$endTransfer(CallbackInfoReturnable<Long> cir) {
+    @Inject(method = "insert", at = @At("RETURN"), require = 0)
+    private void observable$endInsert(CallbackInfoReturnable<Long> cir) {
+        CompatTiming.endAE2DriveOperation();
+    }
+
+    @Inject(method = "extract", at = @At("HEAD"), require = 0)
+    private void observable$beginExtract(CallbackInfoReturnable<Long> cir) {
+        CompatTiming.beginAE2DriveOperation(this, "drive.extract");
+    }
+
+    @Inject(method = "extract", at = @At("RETURN"), require = 0)
+    private void observable$endExtract(CallbackInfoReturnable<Long> cir) {
         CompatTiming.endAE2DriveOperation();
     }
 
     @Inject(method = "isPreferredStorageFor", at = @At("HEAD"), require = 0)
     private void observable$beginPreferredStorageCheck(CallbackInfoReturnable<Boolean> cir) {
-        CompatTiming.beginAE2DriveOperation(this);
+        CompatTiming.beginAE2DriveOperation(this, "drive.preferred");
     }
 
     @Inject(method = "isPreferredStorageFor", at = @At("RETURN"), require = 0)
@@ -42,7 +52,7 @@ public abstract class AE2DriveWatcherMixin {
             at = @At("HEAD"),
             require = 0)
     private void observable$beginAvailableStacks(CallbackInfo ci) {
-        CompatTiming.beginAE2DriveOperation(this);
+        CompatTiming.beginAE2DriveOperation(this, "drive.availableStacks");
     }
 
     @Inject(
