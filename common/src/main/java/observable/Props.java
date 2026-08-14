@@ -20,6 +20,13 @@ public class Props {
     // from the uploaded profile.
     public static volatile Runnable compatProfilerClientViewHook = null;
 
+    // Opt-in compatibility profiling. Regular /observable run and GUI profiles
+    // leave this false, so AE2-specific collectors stay dormant.
+    public static volatile boolean compatProfilerEnabled = false;
+    // Maximum number of AE2 grids kept in full runtime detail after the short
+    // scout phase. The same value also caps exported detailed grids.
+    public static volatile int compatProfilerGridLimit = 0;
+
     public static int entityDepth = -1;
     public static int blockEntityDepth = -1;
     public static int blockDepth = -1;

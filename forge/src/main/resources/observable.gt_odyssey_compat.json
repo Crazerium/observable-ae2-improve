@@ -6,6 +6,7 @@
   "mixins": [
     "AE2TickManagerMixin",
     "AE2GridServiceMixin",
+    "AE2StorageProviderStateMixin",
     "AE2DriveBlockEntityMixin",
     "AE2DriveWatcherMixin"
   ],

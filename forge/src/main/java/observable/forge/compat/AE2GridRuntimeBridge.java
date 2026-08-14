@@ -10,8 +10,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Connects the AE2 compatibility profiler directly to Observable's profiling
- * lifecycle. v20 keeps the full grid breakdown for JSON/HTML/web reports while the
- * in-game overlay is collapsed to a single total marker per AE2 grid.
+ * lifecycle. v20.5.3 remains opt-in: regular Observable runs never start this
+ * lifecycle. Explicit AE2 runs export bounded Top-N detail and publish one
+ * inclusive virtual marker for each exported grid.
  */
 public final class AE2GridRuntimeBridge {
     private static final Logger LOGGER = LogManager.getLogger("Observable/AE2Grid");
@@ -30,11 +31,10 @@ public final class AE2GridRuntimeBridge {
             CompatTiming.onAE2CompatSessionStart();
         };
 
-        // This hook runs before Observable snapshots/uploads the profile. Write the
-        // standalone report first, while blockTimingsMap still contains only real
-        // physical timing buckets. Virtual Grid markers are materialized afterwards
-        // for the normal Observable upload, so they cannot masquerade as a physical
-        // device when a reserved marker coordinate later collides with a real block.
+        // This hook only runs for /observable ae2 ... . Write the bounded standalone
+        // report first, while blockTimingsMap still contains only real physical
+        // timing buckets. Then materialize one virtual Grid marker per requested
+        // Top-N grid for the normal Observable upload.
         Props.compatProfilerSnapshotHook = () -> {
             try {
                 Profiler profiler = Observable.INSTANCE.getPROFILER();
@@ -45,11 +45,10 @@ public final class AE2GridRuntimeBridge {
             }
         };
 
-        // The upload above already captured the full diagnostic profile. Before
-        // the packet is made for the in-game overlay, remove the diagnostic
-        // tower and leave only one inclusive total marker per grid.
+        // Before the packet is made for the in-game overlay, normalize any old
+        // AE2 virtual markers and leave one inclusive marker per requested Top-N grid.
         Props.compatProfilerClientViewHook = AE2GridProfiler::prepareClientOverlay;
 
-        LOGGER.info("Observable AE2 Grid profiler bridge enabled (v20.3.2.7 Typed Cell Owner Resolution + Drive Owner Mapping + Drive Coverage Diagnostics + Profiler Correctness + Large Server Safety + Distribution Modes + report retention + Operation-aware Spike Analysis + Current Diagnosis + Regression Intelligence + duplicate-anchor-safe Compare + moderator TP)");
+        LOGGER.info("Observable AE2 Grid profiler bridge enabled (v20.5.3 Administration Consistency Guard + v20.5.2 Administration Accuracy + retained v20.4.1 Diagnostic Intelligence + Physical Grid Aggregate + Secondary Foreign Dispatch + Robust Burst Detection + v20.3.2.16 Drive Hot Path Cache + ExtendedAE Mount Ownership + On-demand AE2 + 4-tick Scout Top-N Runtime Detail + Compact Reports + Large Server Safety)");
     }
 }

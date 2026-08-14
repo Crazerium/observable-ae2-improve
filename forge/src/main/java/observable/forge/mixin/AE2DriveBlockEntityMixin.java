@@ -6,6 +6,7 @@ import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
  * Registers ME Drives even though DriveBlockEntity itself does not need to be
@@ -26,5 +27,26 @@ public abstract class AE2DriveBlockEntityMixin {
     @Inject(method = "onReady", at = @At("RETURN"), require = 0)
     private void observable$registerDriveWhenReady(CallbackInfo ci) {
         CompatTiming.registerAE2Drive(this);
+    }
+
+    // AE2 15.5.0 creates DriveWatcher only inside updateStateForSlot().
+    // Open a short-lived owner context before the constructor runs so the
+    // DriveWatcher mixin can bind the exact newly-constructed identity to this
+    // DriveBlockEntity. The previous post-slot array capture remains as a
+    // second exact owner-side check.
+    @Inject(method = "updateStateForSlot(I)D", at = @At("HEAD"), require = 0)
+    private void observable$beginWatcherOwnerContext(
+            int slot, CallbackInfoReturnable<Double> cir) {
+        CompatTiming.beginAE2DriveWatcherOwnerContext(this);
+    }
+
+    @Inject(method = "updateStateForSlot(I)D", at = @At("RETURN"), require = 0)
+    private void observable$recordWatcherOwnerAfterSlotRefresh(
+            int slot, CallbackInfoReturnable<Double> cir) {
+        try {
+            CompatTiming.recordAE2DriveWatcherSlotOwner(this, slot);
+        } finally {
+            CompatTiming.endAE2DriveWatcherOwnerContext(this);
+        }
     }
 }

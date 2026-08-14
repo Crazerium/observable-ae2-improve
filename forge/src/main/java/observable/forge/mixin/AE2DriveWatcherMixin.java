@@ -17,6 +17,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Pseudo
 @Mixin(targets = "appeng.me.storage.DriveWatcher", remap = false)
 public abstract class AE2DriveWatcherMixin {
+    // v20.3.2.9: updateStateForSlot() opens an owner context immediately before
+    // this exact object is constructed. Capture identity at constructor RETURN
+    // so stale wrappers remain attributable even after invBySlot replaces them.
+    @Inject(method = "<init>*", at = @At("RETURN"), require = 0)
+    private void observable$recordExactOwnerAtConstruction(CallbackInfo ci) {
+        CompatTiming.recordAE2DriveWatcherConstructed(this);
+    }
+
     @Inject(method = "insert", at = @At("HEAD"), require = 0)
     private void observable$beginInsert(CallbackInfoReturnable<Long> cir) {
         CompatTiming.beginAE2DriveOperation(this, "drive.insert");

@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * Per-grid AE2 profiler used by the Forge compatibility layer.
  *
- * v20.3.2.7 keeps Large Server Safety and replaces the ineffective lazy host refresh with a strictly typed BasicCellInventory save-provider owner resolver, without new mixin targets or recursive reflection.
+ * v20.5.3 keeps the administration-first report and adds a report-side consistency guard without changing collection. Admin triage still separates measured average load from large one-off physical outliers, but now refuses confident TickManager/device attribution when Grid remainder is a dominant majority of Core or when nested inclusive buckets contradict their measured parent hierarchy. All conclusions remain derived from already collected data: no new AE2 injection points are added. AE2 timing remains explicitly opt-in with the scout Top-N runtime cap. The authoritative StorageService.ProviderState mount-owner path still covers both standard AE2 DriveBlockEntity and the exact ExtendedAE TileExDrive provider without recursive storage reflection.
  * The total physical-call distribution remains backward compatible, while a bounded per-operation breakdown separates
  * AE2 TickRateModulation outcomes and ME Drive insert/extract/preferred/available-stacks work. The dashboard also
  * reports Avg beside P50, low-sample percentile confidence, mixed/heavy-tail warnings, and conservative two-mode
@@ -53,8 +53,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Stable network identity remains duplicate-anchor-safe. Operator navigation remains:
  * device-to-grid links, per-call cost, copyable coordinates/teleport commands,
  * Top devices inside a selected Grid, dimension summaries and collapsed diagnostics. No AE2 scheduling or
- * game behavior is changed. The client still receives one inclusive total marker
- * per AE2 grid.
+ * game behavior is changed. The client receives one inclusive total marker only
+ * for the requested Top-N detailed grids.
  *
  * Grid Core is inclusive. Grid Services is the sum of the service calls made by
  * Grid. Grid overhead/remainder is derived as Grid Core - Grid Services and can include both real AE2 work
@@ -66,6 +66,17 @@ public final class AE2GridProfiler {
     private static final Logger LOGGER = LogManager.getLogger("Observable/AE2Grid");
     private static final DateTimeFormatter REPORT_FILE_TIME = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final int REPORT_FILE_LIMIT = 10;
+    // v20.3.2.14 Runtime Top-N. The profiler briefly scouts all grids, then only the
+    // requested Top-N continue through Grid lifecycle/service/queue detail. Reports remain bounded.
+    private static final int DEFAULT_REPORT_GRID_LIMIT = 128;
+    private static final int MAX_REPORT_GRID_LIMIT = 2048;
+    private static final int REPORT_MIN_PHYSICAL_DEVICE_LIMIT = 256;
+    private static final int REPORT_PHYSICAL_DEVICES_PER_GRID = 8;
+    private static final int REPORT_MAX_PHYSICAL_DEVICE_LIMIT = 2048;
+    private static final int REPORT_DISPATCH_LEVEL_LIMIT = 16;
+    // Four server ticks are enough to rank stable production grids while keeping
+    // the expensive all-grid phase short even when the server is below 20 TPS.
+    private static final int RUNTIME_GRID_SCOUT_TICKS = 4;
     public static final int PHASE_SERVER_START = 0;
     public static final int PHASE_LEVEL_START = 1;
     public static final int PHASE_LEVEL_END = 2;
@@ -128,6 +139,24 @@ public final class AE2GridProfiler {
     private static volatile boolean sessionActive;
     private static volatile long sessionGeneration;
 
+    // v20.3.2.14 runtime detail selection. Identity semantics match AE2 Grid objects.
+    // The selected map is built once after the scout and then only read until session end.
+    private static volatile IdentityHashMap<Object, Boolean> RUNTIME_DETAILED_GRIDS = new IdentityHashMap<>();
+    private static volatile boolean runtimeSelectionFrozen;
+    private static volatile int runtimeScoutStartTick = Integer.MIN_VALUE;
+    private static volatile int runtimeScoutTicks;
+    private static volatile int runtimeDiscoveredAtFreeze;
+    private static volatile int runtimeSelectedGridCount;
+    private static volatile long runtimeGridLifecycleSkippedByCap;
+    private static volatile long runtimeGridLifecycleKeptAfterCap;
+    private static volatile long runtimeScoutGridCoreNanos;
+    private static volatile long runtimeScoutServiceNanos;
+    private static volatile long runtimeScoutDeviceNanos;
+    private static volatile long runtimeScoutSchedulerNanos;
+    // Wall-clock context is report-only and lets operators distinguish actual
+    // server lag from profiler sampling counts. No hot-path reads are added.
+    private static volatile long sessionStartedWallMillis;
+
     // v20.3.2.2 Large Server Safety. Worlds up to the historical 255-grid test size remain exact.
     // Above that threshold only hot per-Level lifecycle/service diagnostics are sampled; server-start/end
     // and physical device timings stay exact. Sampling uses rotating deterministic shards plus a hard
@@ -186,6 +215,19 @@ public final class AE2GridProfiler {
             discoveredGridCount = 0;
             sessionGeneration++;
             sessionActive = true;
+            RUNTIME_DETAILED_GRIDS = new IdentityHashMap<>();
+            runtimeSelectionFrozen = false;
+            runtimeScoutStartTick = currentServerTick(null);
+            runtimeScoutTicks = 0;
+            runtimeDiscoveredAtFreeze = 0;
+            runtimeSelectedGridCount = 0;
+            runtimeGridLifecycleSkippedByCap = 0L;
+            runtimeGridLifecycleKeptAfterCap = 0L;
+            runtimeScoutGridCoreNanos = 0L;
+            runtimeScoutServiceNanos = 0L;
+            runtimeScoutDeviceNanos = 0L;
+            runtimeScoutSchedulerNanos = 0L;
+            sessionStartedWallMillis = System.currentTimeMillis();
             SAMPLING.reset();
         }
         DEVICE_TOKEN.remove();
@@ -225,10 +267,44 @@ public final class AE2GridProfiler {
             }
             String dimension = level.dimension().location().toString();
             String key = physicalDeviceKey(dimension, pos);
+            PhysicalDeviceRef byPosition = PHYSICAL_DEVICES.get(key);
+            if (byPosition != null && byPosition.host == null) {
+                byPosition.host = host;
+                if (!name.isBlank()) {
+                    byPosition.preferredName = name;
+                }
+                PHYSICAL_DEVICE_HOSTS.put(host, byPosition);
+                return;
+            }
             PhysicalDeviceRef ref = new PhysicalDeviceRef(
                     host, dimension, new BlockPos(pos.getX(), pos.getY(), pos.getZ()), name);
             PHYSICAL_DEVICE_HOSTS.put(host, ref);
             PHYSICAL_DEVICES.put(key, ref);
+        }
+    }
+
+    /**
+     * Registers a physical target by immutable dimension + coordinates when the
+     * original BlockEntity has already unloaded but a stale DriveWatcher is still
+     * performing storage work. This retains no level/chunk/world reference.
+     */
+    static void registerVirtualPhysicalDevice(ResourceKey<Level> dimension, BlockPos pos, String preferredName) {
+        if (!sessionActive || dimension == null || pos == null) {
+            return;
+        }
+        String dimensionName = dimension.location().toString();
+        String key = physicalDeviceKey(dimensionName, pos);
+        String name = preferredName == null ? "" : preferredName;
+        synchronized (LOCK) {
+            PhysicalDeviceRef existing = PHYSICAL_DEVICES.get(key);
+            if (existing != null) {
+                if (!name.isBlank()) {
+                    existing.preferredName = name;
+                }
+                return;
+            }
+            PHYSICAL_DEVICES.put(key, new PhysicalDeviceRef(
+                    null, dimensionName, new BlockPos(pos.getX(), pos.getY(), pos.getZ()), name));
         }
     }
 
@@ -238,36 +314,62 @@ public final class AE2GridProfiler {
 
     /**
      * v20.3.1: records the duration of one already-timed AE2 physical call plus an optional operation label.
-     * This adds no new AE2 hook; CompatTiming calls it after its existing timing window closes.
+     * v20.3.2.16 also exposes an opaque session-local handle so the extremely hot
+     * DriveWatcher path does not repeat LOCK/map/Level lookup on every sub-microsecond call.
      */
-    static void recordPhysicalSpike(BlockEntity host, long elapsedNanos, String operation) {
-        if (!sessionActive || host == null || elapsedNanos < 0L) {
-            return;
+    static Object physicalSpikeHandle(BlockEntity host) {
+        if (!sessionActive || host == null) {
+            return null;
         }
-
-        PhysicalDeviceRef ref;
         synchronized (LOCK) {
-            ref = PHYSICAL_DEVICE_HOSTS.get(host);
+            return PHYSICAL_DEVICE_HOSTS.get(host);
         }
-        if (ref == null) {
+    }
+
+    static Object physicalSpikeHandle(ResourceKey<Level> dimension, BlockPos pos) {
+        if (!sessionActive || dimension == null || pos == null) {
+            return null;
+        }
+        synchronized (LOCK) {
+            return PHYSICAL_DEVICES.get(physicalDeviceKey(dimension.location().toString(), pos));
+        }
+    }
+
+    static void recordPhysicalSpike(BlockEntity host, long elapsedNanos, String operation) {
+        if (host == null) {
             return;
         }
+        recordPhysicalSpikeHandle(physicalSpikeHandle(host), elapsedNanos, operation);
+    }
 
-        int tickOffset = -1;
+    static void recordPhysicalSpike(
+            ResourceKey<Level> dimension, BlockPos pos, long elapsedNanos, String operation) {
+        recordPhysicalSpikeHandle(physicalSpikeHandle(dimension, pos), elapsedNanos, operation);
+    }
+
+    /** Fast path used by session-cached DriveWatcher timing state. */
+    static void recordPhysicalSpikeHandle(Object opaqueHandle, long elapsedNanos, String operation) {
+        if (!sessionActive || elapsedNanos < 0L || !(opaqueHandle instanceof PhysicalDeviceRef)) {
+            return;
+        }
+        PhysicalDeviceRef ref = (PhysicalDeviceRef) opaqueHandle;
+        int tickOffset = currentProfileTickOffset();
+        synchronized (ref.spikes) {
+            ref.spikes.record(elapsedNanos, tickOffset, operation);
+        }
+    }
+
+    private static int currentProfileTickOffset() {
         try {
-            Level level = host.getLevel();
-            if (level instanceof ServerLevel) {
-                Profiler profiler = Observable.INSTANCE.getPROFILER();
-                int currentTick = ((ServerLevel) level).getServer().getTickCount();
-                tickOffset = Math.max(0, currentTick - profiler.getStartingTicks());
+            Profiler profiler = Observable.INSTANCE.getPROFILER();
+            net.minecraft.server.MinecraftServer server = dev.architectury.utils.GameInstance.getServer();
+            if (server != null) {
+                return Math.max(0, server.getTickCount() - profiler.getStartingTicks());
             }
         } catch (Throwable ignored) {
             // Timeline metadata is optional. Distribution/max recording must still work.
         }
-
-        synchronized (ref.spikes) {
-            ref.spikes.record(elapsedNanos, tickOffset, operation);
-        }
+        return -1;
     }
 
     private static void linkPhysicalDeviceToGrid(BlockEntity host, GridInfo info) {
@@ -367,10 +469,17 @@ public final class AE2GridProfiler {
         GridInfo info = getOrCreateGrid(grid);
         ensureAnchor(info, host);
         linkPhysicalDeviceToGrid(host, info);
+        if (runtimeSelectionFrozen && !runtimeGridSelected(grid)) {
+            return;
+        }
         DEVICE_TOKEN.set(new DeviceToken(info, System.nanoTime(), sessionGeneration));
     }
 
     public static void endDevice() {
+        if (Props.notProcessing || !sessionActive) {
+            DEVICE_TOKEN.remove();
+            return;
+        }
         endDeviceAt(System.nanoTime(), null);
     }
 
@@ -398,7 +507,7 @@ public final class AE2GridProfiler {
             return;
         }
         GridInfo info = findGridForTickManager(tickManager);
-        if (info == null) {
+        if (info == null || !runtimeGridSelected(info.grid)) {
             return;
         }
         TICK_MANAGER_SECTION_STACK.get().push(
@@ -407,7 +516,6 @@ public final class AE2GridProfiler {
 
     /** Finish an internal TickManagerService section. */
     public static void endTickManagerSection(Object tickManager, int sectionId) {
-        long finishedAt = System.nanoTime();
         TickSection section = TickSection.fromId(sectionId);
         if (tickManager == null || section == null) {
             return;
@@ -417,6 +525,7 @@ public final class AE2GridProfiler {
         if (token == null || Props.notProcessing || !sessionActive || token.generation != sessionGeneration) {
             return;
         }
+        long finishedAt = System.nanoTime();
 
         synchronized (token.grid) {
             Metric metric = token.section == TickSection.LEVEL_QUEUE
@@ -438,7 +547,7 @@ public final class AE2GridProfiler {
             return;
         }
         GridInfo info = findGridForTickManager(tickManager);
-        if (info == null) {
+        if (info == null || !runtimeGridSelected(info.grid)) {
             return;
         }
 
@@ -459,6 +568,9 @@ public final class AE2GridProfiler {
 
     /** Called immediately before PriorityQueue.peek(). */
     public static void tickQueueHeadCheck(Object tickManager) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -471,6 +583,9 @@ public final class AE2GridProfiler {
 
     /** The queue head is due and PriorityQueue.poll() is about to run. */
     public static void tickQueuePoll(Object tickManager) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -485,6 +600,9 @@ public final class AE2GridProfiler {
 
     /** unsafeTickingRequest is about to run; dequeue/diff/node preparation is complete. */
     public static void tickQueueBeforeDevice(Object tickManager) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -500,6 +618,9 @@ public final class AE2GridProfiler {
 
     /** setLastTick is about to run after the device callback returned. */
     public static void tickQueueAfterDevice(Object tickManager) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -510,6 +631,9 @@ public final class AE2GridProfiler {
 
     /** Enters either the SLEEP transition or the awake-check/requeue branch. */
     public static void tickQueueBranch(Object tickManager, int branchId) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -526,6 +650,9 @@ public final class AE2GridProfiler {
 
     /** PriorityQueue.add is about to reinsert an awake tracker into the heap. */
     public static void tickQueueReinsert(Object tickManager) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         TickQueueDetailToken token = findTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
@@ -540,12 +667,15 @@ public final class AE2GridProfiler {
 
     /** Called from tickQueue RETURN before the inclusive tickQueue timer stops. */
     public static void finishTickQueueDetail(Object tickManager) {
-        long now = System.nanoTime();
+        if (Props.notProcessing || !sessionActive) {
+            TICK_QUEUE_DETAIL_STACK.remove();
+            return;
+        }
         TickQueueDetailToken token = removeTickQueueDetailToken(tickManager);
         if (!validTickQueueToken(token)) {
             return;
         }
-        closeTickQueuePhase(token, now, true);
+        closeTickQueuePhase(token, System.nanoTime(), true);
     }
 
     private static boolean validTickQueueToken(TickQueueDetailToken token) {
@@ -657,7 +787,7 @@ public final class AE2GridProfiler {
             return;
         }
         GridInfo info = findGridForTickManager(tickManager);
-        if (info == null) {
+        if (info == null || !runtimeGridSelected(info.grid)) {
             return;
         }
         TICK_MANAGER_CONTROL_STACK.get().push(
@@ -666,7 +796,6 @@ public final class AE2GridProfiler {
 
     /** Finish measuring ITickManager sleep/wake/alert bookkeeping. */
     public static void endTickManagerControl(Object tickManager, int controlId) {
-        long finishedAt = System.nanoTime();
         TickControl control = TickControl.fromId(controlId);
         if (tickManager == null || control == null) {
             return;
@@ -676,6 +805,7 @@ public final class AE2GridProfiler {
         if (token == null || Props.notProcessing || !sessionActive || token.generation != sessionGeneration) {
             return;
         }
+        long finishedAt = System.nanoTime();
 
         synchronized (token.grid) {
             recordLocked(controlMetric(token.grid.tickManager, control), finishedAt - token.startedAt, token.weight);
@@ -698,9 +828,20 @@ public final class AE2GridProfiler {
             return null;
         }
 
-        // Decide the Level shard before touching GRIDS/anchor metadata. On a 16x large-server shard,
-        // roughly 15/16 skipped callbacks therefore avoid the IdentityHashMap lock and all metadata work.
-        int weight = samplingWeight(grid, phase, level);
+        int serverTick = currentServerTick(level);
+        maybeFreezeRuntimeSelection(serverTick);
+        if (runtimeSelectionFrozen) {
+            if (!runtimeGridSelected(grid)) {
+                runtimeGridLifecycleSkippedByCap++;
+                return null;
+            }
+            runtimeGridLifecycleKeptAfterCap++;
+        }
+
+        // During the scout every grid participates. After the Top-N is frozen,
+        // the sampling controller sees only the selected population, so a limit
+        // such as 32 does not keep paying a 16x/32x shard chosen for thousands of grids.
+        int weight = samplingWeight(grid, phase, level, serverTick, runtimeSamplingGridCount());
         if (weight <= 0) {
             return null;
         }
@@ -714,7 +855,6 @@ public final class AE2GridProfiler {
 
     /** Called at RETURN with the opaque token returned by beginGridLifecycle. */
     public static void endGridLifecycle(Object opaqueToken) {
-        long finishedAt = System.nanoTime();
         if (!(opaqueToken instanceof GridLifecycleToken)) {
             return;
         }
@@ -722,7 +862,7 @@ public final class AE2GridProfiler {
         if (Props.notProcessing || !sessionActive || token.generation != sessionGeneration) {
             return;
         }
-        long elapsed = finishedAt - token.startedAt;
+        long elapsed = System.nanoTime() - token.startedAt;
         synchronized (token.grid) {
             recordLocked(token.grid.gridCore, elapsed, token.weight);
             recordLocked(token.grid.gridPhases.get(token.phase), elapsed, token.weight);
@@ -734,31 +874,29 @@ public final class AE2GridProfiler {
         // Intentionally no-op: v20.3.2.2's allocation-free skipped path requires token pairing.
     }
 
-    private static int samplingWeight(Object grid, Phase phase, Level level) {
+    private static int samplingWeight(Object grid, Phase phase, Level level, int serverTick, int gridCount) {
         if (phase != Phase.LEVEL_START && phase != Phase.LEVEL_END) {
             SAMPLING.recordExactLifecycle();
             return 1;
         }
-
-        int serverTick = Integer.MIN_VALUE;
-        if (level instanceof ServerLevel) {
-            try {
-                serverTick = ((ServerLevel) level).getServer().getTickCount();
-            } catch (Throwable ignored) {
-                // If tick metadata is unavailable, fail toward exact timing rather than corrupting estimates.
-            }
-        }
-        return SAMPLING.admit(grid, phase, level, serverTick, discoveredGridCount);
+        return SAMPLING.admit(grid, phase, level, serverTick, gridCount);
     }
 
     /** Enter the service call represented by a lifecycle sample. Null means skipped diagnostics. */
     public static void enterDetailScope(Object lifecycleToken) {
+        if (Props.notProcessing || !sessionActive) {
+            return;
+        }
         int weight = lifecycleToken instanceof GridLifecycleToken
                 ? ((GridLifecycleToken) lifecycleToken).weight : 0;
         DETAIL_SCOPE.get().push(weight);
     }
 
     public static void exitDetailScope() {
+        if (Props.notProcessing || !sessionActive) {
+            DETAIL_SCOPE.remove();
+            return;
+        }
         DetailScopeState state = DETAIL_SCOPE.get();
         state.pop();
         if (state.depth == 0) {
@@ -831,7 +969,6 @@ public final class AE2GridProfiler {
 
     /** Called immediately after the service method returns (also from finally). */
     public static void endService(Object opaqueToken) {
-        long finishedAt = System.nanoTime();
         if (!(opaqueToken instanceof ServiceToken)) {
             return;
         }
@@ -841,7 +978,7 @@ public final class AE2GridProfiler {
             return;
         }
 
-        long elapsed = finishedAt - token.startedAt;
+        long elapsed = System.nanoTime() - token.startedAt;
         synchronized (token.grid) {
             recordLocked(token.service.total, elapsed, token.weight);
             recordLocked(token.service.phases.get(token.phase), elapsed, token.weight);
@@ -867,7 +1004,7 @@ public final class AE2GridProfiler {
             return Collections.emptyList();
         }
 
-        List<GridSnapshot> snapshots = snapshotsSorted();
+        List<GridSnapshot> snapshots = reportGridSnapshots(snapshotsSorted(), requestedReportGridLimit());
         int count = Math.min(Math.max(limit, 0), snapshots.size());
         List<String> lines = new ArrayList<>();
 
@@ -994,11 +1131,171 @@ public final class AE2GridProfiler {
         }
     }
 
+    private static int requestedReportGridLimit() {
+        int requested = Props.compatProfilerGridLimit;
+        if (requested <= 0) {
+            requested = DEFAULT_REPORT_GRID_LIMIT;
+        }
+        return Math.max(1, Math.min(MAX_REPORT_GRID_LIMIT, requested));
+    }
+
+    private static int currentServerTick(Level level) {
+        try {
+            if (level instanceof ServerLevel) {
+                return ((ServerLevel) level).getServer().getTickCount();
+            }
+            net.minecraft.server.MinecraftServer server = dev.architectury.utils.GameInstance.getServer();
+            return server == null ? Integer.MIN_VALUE : server.getTickCount();
+        } catch (Throwable ignored) {
+            return Integer.MIN_VALUE;
+        }
+    }
+
+    private static boolean runtimeGridSelected(Object grid) {
+        if (!runtimeSelectionFrozen) {
+            return true;
+        }
+        IdentityHashMap<Object, Boolean> selected = RUNTIME_DETAILED_GRIDS;
+        return selected != null && selected.containsKey(grid);
+    }
+
+    private static void maybeFreezeRuntimeSelection(int serverTick) {
+        if (runtimeSelectionFrozen || serverTick == Integer.MIN_VALUE) {
+            return;
+        }
+        if (runtimeScoutStartTick == Integer.MIN_VALUE) {
+            runtimeScoutStartTick = serverTick;
+            return;
+        }
+        int elapsedTicks = serverTick - runtimeScoutStartTick;
+        if (elapsedTicks < RUNTIME_GRID_SCOUT_TICKS) {
+            return;
+        }
+
+        synchronized (LOCK) {
+            if (runtimeSelectionFrozen) {
+                return;
+            }
+            List<GridInfo> candidates = new ArrayList<>(GRIDS.values());
+            candidates.sort(new Comparator<GridInfo>() {
+                @Override
+                public int compare(GridInfo left, GridInfo right) {
+                    long leftCore;
+                    long rightCore;
+                    long leftDevices;
+                    long rightDevices;
+                    synchronized (left) {
+                        leftCore = left.gridCore.nanos;
+                        leftDevices = left.devices.nanos;
+                    }
+                    synchronized (right) {
+                        rightCore = right.gridCore.nanos;
+                        rightDevices = right.devices.nanos;
+                    }
+                    int byCore = Long.compare(rightCore, leftCore);
+                    if (byCore != 0) return byCore;
+                    int byDevices = Long.compare(rightDevices, leftDevices);
+                    if (byDevices != 0) return byDevices;
+                    return left.label.compareTo(right.label);
+                }
+            });
+
+            int limit = Math.min(requestedReportGridLimit(), candidates.size());
+            IdentityHashMap<Object, Boolean> selected = new IdentityHashMap<>();
+            for (int i = 0; i < limit; i++) {
+                selected.put(candidates.get(i).grid, Boolean.TRUE);
+            }
+
+            long scoutCore = 0L;
+            long scoutServices = 0L;
+            long scoutDevices = 0L;
+            long scoutScheduler = 0L;
+            for (GridInfo info : candidates) {
+                synchronized (info) {
+                    scoutCore += Math.max(0L, info.gridCore.nanos);
+                    scoutDevices += Math.max(0L, info.devices.nanos);
+                    long serviceTotal = 0L;
+                    for (ServiceInfo service : info.services.values()) {
+                        serviceTotal += Math.max(0L, service.total.nanos);
+                    }
+                    scoutServices += serviceTotal;
+                    scoutScheduler += Math.max(0L, info.tickManager.queue.nanos - info.devices.nanos);
+                }
+            }
+
+            RUNTIME_DETAILED_GRIDS = selected;
+            runtimeScoutTicks = Math.max(1, elapsedTicks);
+            runtimeDiscoveredAtFreeze = candidates.size();
+            runtimeSelectedGridCount = selected.size();
+            runtimeScoutGridCoreNanos = scoutCore;
+            runtimeScoutServiceNanos = scoutServices;
+            runtimeScoutDeviceNanos = scoutDevices;
+            runtimeScoutSchedulerNanos = scoutScheduler;
+            runtimeSelectionFrozen = true;
+            LOGGER.info(
+                    "Observable AE2 runtime selection frozen after {} scout ticks: {} of {} grids keep full detail",
+                    runtimeScoutTicks, runtimeSelectedGridCount, runtimeDiscoveredAtFreeze);
+        }
+    }
+
+    private static int runtimeSamplingGridCount() {
+        if (runtimeSelectionFrozen && runtimeSelectedGridCount > 0) {
+            return runtimeSelectedGridCount;
+        }
+        return discoveredGridCount;
+    }
+
+    private static List<GridSnapshot> reportGridSnapshots(List<GridSnapshot> allSnapshots, int limit) {
+        if (allSnapshots == null || allSnapshots.isEmpty() || limit <= 0) {
+            return Collections.emptyList();
+        }
+        if (!runtimeSelectionFrozen) {
+            return firstItems(allSnapshots, limit);
+        }
+        List<GridSnapshot> selected = new ArrayList<>();
+        for (GridSnapshot snapshot : allSnapshots) {
+            if (snapshot.runtimeDetailed) {
+                selected.add(snapshot);
+            }
+        }
+        return firstItems(selected, limit);
+    }
+
+    private static int requestedPhysicalDeviceLimit(int gridLimit) {
+        long scaled = (long) Math.max(1, gridLimit) * REPORT_PHYSICAL_DEVICES_PER_GRID;
+        int requested = (int) Math.min(REPORT_MAX_PHYSICAL_DEVICE_LIMIT, scaled);
+        return Math.max(REPORT_MIN_PHYSICAL_DEVICE_LIMIT, requested);
+    }
+
+    private static <T> List<T> firstItems(List<T> source, int limit) {
+        if (source == null || source.isEmpty() || limit <= 0) {
+            return Collections.emptyList();
+        }
+        if (source.size() <= limit) {
+            return source;
+        }
+        return new ArrayList<>(source.subList(0, limit));
+    }
+
+    private static String snapshotDimension(GridSnapshot snapshot) {
+        if (snapshot == null) {
+            return "unknown";
+        }
+        try {
+            if (snapshot.anchorEntity != null && snapshot.anchorEntity.getLevel() != null) {
+                return snapshot.anchorEntity.getLevel().dimension().location().toString();
+            }
+        } catch (Throwable ignored) {
+            // Custom Level implementations must not break report generation.
+        }
+        return "unknown";
+    }
+
     /**
-     * Writes the complete AE2 grid breakdown to a standalone JSON file. This is
+     * Writes a bounded AE2 grid breakdown to a standalone JSON file. This is
      * intentionally separate from Observable's own uploaded profile: the file
-     * is easier to archive/compare while the uploaded profile keeps the same
-     * virtual metrics for the web visualizer.
+     * is easier to archive/compare while the normal Observable upload receives
+     * only one inclusive marker for the requested Top-N grids.
      */
     public static Path writeDetailedReport(int profileTicks) {
         if (profileTicks <= 0) {
@@ -1006,9 +1303,15 @@ public final class AE2GridProfiler {
         }
 
         try {
-            List<GridSnapshot> snapshots = snapshotsSorted();
-            List<PhysicalDeviceSnapshot> physicalDevices = physicalDevicesSorted();
-            DriveCoverageReportSnapshot driveCoverage = driveCoverageSnapshot(physicalDevices);
+            List<GridSnapshot> allSnapshots = snapshotsSorted();
+            List<PhysicalDeviceSnapshot> allPhysicalDevices = physicalDevicesSorted();
+            DriveCoverageReportSnapshot driveCoverage = driveCoverageSnapshot(allPhysicalDevices);
+
+            int gridLimit = requestedReportGridLimit();
+            int physicalDeviceLimit = requestedPhysicalDeviceLimit(gridLimit);
+            List<GridSnapshot> snapshots = reportGridSnapshots(allSnapshots, gridLimit);
+            List<PhysicalDeviceSnapshot> physicalDevices = firstItems(allPhysicalDevices, physicalDeviceLimit);
+
             Path directory = FMLPaths.GAMEDIR.get().resolve("observable-reports");
             Files.createDirectories(directory);
 
@@ -1016,7 +1319,9 @@ public final class AE2GridProfiler {
             Path jsonFile = directory.resolve(baseName + ".json");
             Path htmlFile = directory.resolve(baseName + ".html");
 
-            String json = buildDetailedReportJson(snapshots, physicalDevices, driveCoverage, profileTicks);
+            String json = buildDetailedReportJson(
+                    allSnapshots, snapshots, allPhysicalDevices, physicalDevices,
+                    driveCoverage, profileTicks, gridLimit, physicalDeviceLimit);
             Files.writeString(jsonFile, json, StandardCharsets.UTF_8);
             LOGGER.info("Observable AE2 detailed report written to {}", jsonFile.toAbsolutePath());
 
@@ -1190,6 +1495,10 @@ public final class AE2GridProfiler {
         return result;
     }
 
+    private static boolean isDrivePhysicalType(String type) {
+        return "ae2:drive".equals(type) || "expatternprovider:ex_drive".equals(type);
+    }
+
     private static DriveCoverageReportSnapshot driveCoverageSnapshot(List<PhysicalDeviceSnapshot> physicalDevices) {
         CompatTiming.DriveCoverageSnapshot resolver = CompatTiming.snapshotAE2DriveCoverage();
         int physicalDriveTargets = 0;
@@ -1202,7 +1511,7 @@ public final class AE2GridProfiler {
         long otherCalls = 0L;
 
         for (PhysicalDeviceSnapshot device : physicalDevices) {
-            if (!"ae2:drive".equals(device.type)) {
+            if (!isDrivePhysicalType(device.type)) {
                 continue;
             }
             physicalDriveTargets++;
@@ -1252,7 +1561,7 @@ public final class AE2GridProfiler {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Observable AE2 Monitoring v20.3.2.7</title>
+<title>Observable AE2 Monitoring v20.5.3</title>
 <style>
 :root{color-scheme:dark;--bg:#0b0f14;--panel:#121923;--panel2:#182230;--line:#263447;--text:#e7edf5;--muted:#93a4b8;--accent:#66d9ef;--accent2:#a6e3a1;--warn:#f9e2af;--hot:#f38ba8;--good:#94e2d5;--low:#89b4fa}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}button,input,select{font:inherit}
@@ -1264,35 +1573,27 @@ main{max-width:1500px;margin:0 auto;padding:24px 18px 56px}.top{display:flex;gap
 .toolbar{display:grid;grid-template-columns:minmax(220px,2fr) minmax(210px,1.4fr) 125px 170px 110px auto auto;gap:8px;align-items:end;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px;margin-bottom:10px}.device-toolbar{grid-template-columns:minmax(250px,2fr) minmax(210px,1.4fr) 125px 150px 110px auto}.field{display:flex;flex-direction:column;gap:5px}.field label{font-size:12px;color:var(--muted)}.field input,.field select{width:100%;border:1px solid var(--line);background:#0d131b;color:var(--text);padding:8px 9px;border-radius:8px;outline:none}.field input:focus,.field select:focus{border-color:var(--accent)}.check{display:flex;align-items:center;gap:7px;height:36px;white-space:nowrap;color:var(--muted)}.check input{accent-color:var(--accent)}
 .status{display:flex;gap:14px;align-items:center;flex-wrap:wrap;color:var(--muted);margin:0 0 10px}.status strong{color:var(--text)}
 .table-scroll{overflow:auto;max-height:520px;border:1px solid var(--line);border-radius:9px}.table-scroll.compact{max-height:430px}.data-table{width:100%;border-collapse:collapse;min-width:850px}.data-table th,.data-table td{padding:7px 8px;border-top:1px solid rgba(38,52,71,.55);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.data-table th:first-child,.data-table td:first-child{text-align:left}.data-table thead{position:sticky;top:0;background:var(--panel2);z-index:2}.data-table tbody tr.clickable{cursor:pointer}.data-table tbody tr.clickable:hover{background:rgba(102,217,239,.06)}.data-table tbody tr.selected{background:rgba(102,217,239,.10)}.left{text-align:left!important}.clip{max-width:360px;overflow:hidden;text-overflow:ellipsis}.dim{max-width:330px;overflow:hidden;text-overflow:ellipsis}
-.badge{display:inline-block;min-width:44px;text-align:center;border:1px solid var(--line);padding:2px 6px;border-radius:999px;font-size:11px}.sev-hot{color:var(--hot);border-color:#7c3f50;background:#2a1720}.sev-warn{color:var(--warn);border-color:#665b32;background:#211f16}.sev-mid{color:var(--accent);border-color:#285f6c;background:#102329}.sev-low{color:var(--low);border-color:#354d76;background:#111b2b}
+.pattern-pill{display:inline-block;max-width:190px;overflow:hidden;text-overflow:ellipsis;vertical-align:middle;border:1px solid var(--line);padding:2px 7px;border-radius:999px;font-size:11px;color:var(--muted);background:#0d131b}.pattern-pill.hot{color:var(--hot);border-color:#7c3f50;background:#2a1720}.pattern-pill.warn{color:var(--warn);border-color:#665b32;background:#211f16}.pattern-pill.info{color:var(--accent);border-color:#285f6c;background:#102329}.priority-list{display:grid;gap:8px}.priority-item{display:grid;grid-template-columns:92px minmax(180px,1fr) 120px minmax(260px,2fr) auto;gap:10px;align-items:center;border-top:1px solid rgba(38,52,71,.55);padding:8px 0}.priority-item:first-child{border-top:0}.priority-rank{font-weight:700}.priority-reason{color:var(--muted)}.badge{display:inline-block;min-width:44px;text-align:center;border:1px solid var(--line);padding:2px 6px;border-radius:999px;font-size:11px}.sev-hot{color:var(--hot);border-color:#7c3f50;background:#2a1720}.sev-warn{color:var(--warn);border-color:#665b32;background:#211f16}.sev-mid{color:var(--accent);border-color:#285f6c;background:#102329}.sev-low{color:var(--low);border-color:#354d76;background:#111b2b}
 .summary-wrap{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(330px,.7fr);gap:12px;margin:12px 0}.selection-panel .big{font-size:28px;font-weight:700;margin:3px 0}.kv{display:grid;grid-template-columns:1fr auto;gap:5px 10px;margin-top:8px}.kv span:nth-child(odd){color:var(--muted)}
 .row{display:grid;grid-template-columns:minmax(190px,1.1fr) minmax(220px,2.8fr) 115px 105px;gap:10px;align-items:center;padding:7px 0;border-top:1px solid rgba(38,52,71,.55)}.row:first-of-type{border-top:0}.label{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.barbox{height:13px;background:#0d131b;border-radius:99px;overflow:hidden;border:1px solid #202c3a}.bar{height:100%;min-width:0;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:99px}.value{text-align:right;font-variant-numeric:tabular-nums}.calls{text-align:right;color:var(--muted);font-variant-numeric:tabular-nums}.indent1 .label{padding-left:16px}.indent2 .label{padding-left:32px}.hot .bar{background:linear-gradient(90deg,var(--warn),var(--hot))}
 .meta{display:flex;gap:15px;flex-wrap:wrap;color:var(--muted);margin:5px 0 10px}.empty{color:var(--muted);padding:8px 0}.mods{display:grid;grid-template-columns:repeat(3,minmax(150px,1fr));gap:8px}.mod{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px}.mod strong{font-size:17px;display:block}
 details.advanced{padding:0;overflow:hidden}details.advanced>summary{cursor:pointer;padding:13px 14px;font-weight:650;background:var(--panel2);list-style:none}details.advanced>summary::-webkit-details-marker{display:none}details.advanced>summary:before{content:'▶';display:inline-block;margin-right:8px;color:var(--accent);transition:transform .12s}details.advanced[open]>summary:before{transform:rotate(90deg)}.advanced-body{padding:2px 13px 13px}.advanced-body section{background:#0f161f;margin:10px 0}.dispatch-scroll{max-height:390px;overflow:auto;border:1px solid var(--line);border-radius:9px}.foreign{color:var(--warn)}.anchor{color:var(--good)}
-.simple-hero{background:linear-gradient(135deg,#102329,#161d2a);border:1px solid #285f6c;border-radius:14px;padding:18px;margin:12px 0}.simple-hero h2{font-size:21px;margin:0 0 7px}.simple-hero .big{font-size:30px;font-weight:750;margin:4px 0}.simple-hero .lead{font-size:15px;max-width:950px}.diagnosis-grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:9px}.diag-card{background:#0f161f;border:1px solid var(--line);border-radius:10px;padding:11px}.diag-card.hot{border-color:#7c3f50;background:#21151c}.diag-card.warn{border-color:#665b32;background:#1e1c15}.diag-card.info{border-color:#285f6c}.diag-card h3{font-size:14px;margin:0 0 5px}.diag-value{font-size:19px;font-weight:700;margin:2px 0}.diag-text{color:var(--muted);margin-top:4px}.observer-note{border-color:#3c536b;background:#101923;color:var(--muted)}.observer-note b{color:var(--text)}.spike-grid{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:9px}.spike-card{background:#0f161f;border:1px solid var(--line);border-radius:10px;padding:11px}.spike-card h3{font-size:14px;margin:0 0 5px}.spike-stats{display:grid;grid-template-columns:repeat(5,minmax(76px,1fr));gap:6px;margin:8px 0}.spike-stats div{background:#0b1118;border:1px solid #202c3a;border-radius:7px;padding:6px}.spike-stats small{display:block;color:var(--muted)}.spike-shape{border:1px solid #665b32;background:#1e1c15;color:var(--warn);border-radius:7px;padding:7px 8px;margin:7px 0}.op-list{display:grid;gap:4px;margin-top:7px}.op-row{display:grid;grid-template-columns:minmax(110px,1.2fr) 70px repeat(4,minmax(70px,1fr));gap:6px;align-items:center;background:#0b1118;border:1px solid #202c3a;border-radius:7px;padding:5px 7px;font-size:12px}.op-row span:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}.mode-split{margin-top:5px;padding:6px 7px;border:1px solid #285f6c;background:#101923;border-radius:7px;font-size:12px}.mode-split b{color:var(--accent)}.mode-pill{display:inline-block;margin:3px 5px 0 0;padding:2px 6px;border:1px solid #354d76;border-radius:999px;color:var(--low)}.sparkline{height:34px;display:flex;align-items:flex-end;gap:2px;margin-top:8px;padding:3px;background:#0b1118;border:1px solid #202c3a;border-radius:7px;overflow:hidden}.sparkbar{min-width:3px;flex:1;background:linear-gradient(180deg,var(--hot),var(--accent));border-radius:2px 2px 0 0}.spike-events{color:var(--muted);font-size:12px;margin-top:6px}.simple-issues{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:10px}.simple-issue{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px}.simple-issue.hot{border-color:#7c3f50}.simple-issue h3{font-size:15px;margin:0 0 5px}.simple-load{font-size:22px;font-weight:700}.simple-why{margin:6px 0;color:var(--muted)}.simple-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.simple-actions button{appearance:none;border:1px solid var(--line);background:#101923;color:var(--text);padding:5px 8px;border-radius:7px;cursor:pointer}.simple-actions button:hover{border-color:var(--accent)}.plain-good{color:var(--good)}.plain-warn{color:var(--warn)}.plain-hot{color:var(--hot)}.simple-list{display:grid;gap:8px}.simple-device{display:grid;grid-template-columns:minmax(210px,1.4fr) 115px minmax(210px,1.3fr) minmax(230px,1.6fr);gap:10px;align-items:center;border-top:1px solid rgba(38,52,71,.6);padding:9px 0}.simple-device:first-child{border-top:0}.simple-device .where{color:var(--muted)}.simple-compare-summary{font-size:16px;margin:8px 0 12px}.simple-shell.hidden,.expert-shell.hidden{display:none}.mode-hint{color:var(--muted);font-size:12px;margin-top:4px}.simple-explain{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}.simple-explain>div{background:#0f161f;border:1px solid var(--line);border-radius:9px;padding:10px}.type-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:8px;margin-bottom:12px}.type-card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px}.type-card strong{display:block;font-size:17px;margin:2px 0}.type-card small{color:var(--muted)}.mini-actions{display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap}.mini-btn,.grid-link{appearance:none;border:1px solid var(--line);background:#101923;color:var(--text);padding:3px 7px;border-radius:6px;cursor:pointer;font-size:11px}.mini-btn:hover,.grid-link:hover{border-color:var(--accent)}.grid-link{color:var(--accent);white-space:nowrap}.coord-line{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.compare-toolbar{display:grid;grid-template-columns:minmax(230px,1.5fr) 170px 130px 130px 150px;gap:8px;align-items:end}.drop-zone{border:1px dashed #4b6688;border-radius:10px;padding:14px;background:#0d131b}.drop-zone.drag{border-color:var(--accent);background:#102329}.delta-up{color:var(--hot);font-weight:650}.delta-down{color:var(--good);font-weight:650}.delta-new{color:var(--warn);font-weight:650}.delta-gone{color:var(--muted);font-weight:650}.status-pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px}.compare-help{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}.footer{margin-top:22px;color:var(--muted);font-size:12px}
-@media(max-width:1100px){.cards{grid-template-columns:repeat(3,1fr)}.toolbar,.device-toolbar,.compare-toolbar{grid-template-columns:repeat(3,minmax(150px,1fr))}.dashboard-grid,.summary-wrap{grid-template-columns:1fr}.type-grid{grid-template-columns:repeat(2,1fr)}.simple-issues,.diagnosis-grid,.spike-grid{grid-template-columns:1fr}.simple-device{grid-template-columns:1fr 110px 1fr}.simple-device .simple-actions{grid-column:1/4}.simple-explain{grid-template-columns:1fr}}
-@media(max-width:720px){.cards{grid-template-columns:repeat(2,1fr)}.toolbar,.device-toolbar,.compare-toolbar{grid-template-columns:1fr 1fr}.row{grid-template-columns:1fr 90px}.barbox{grid-column:1/3;grid-row:2}.calls{display:none}.mods,.type-grid{grid-template-columns:1fr}.data-table{min-width:760px}.simple-device{grid-template-columns:1fr}.simple-device .simple-actions{grid-column:auto}.simple-hero .big{font-size:24px}}
+.simple-hero{background:linear-gradient(135deg,#102329,#161d2a);border:1px solid #285f6c;border-radius:14px;padding:18px;margin:12px 0}.simple-hero h2{font-size:21px;margin:0 0 7px}.simple-hero .big{font-size:30px;font-weight:750;margin:4px 0}.simple-hero .lead{font-size:15px;max-width:1050px}.admin-summary{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px;margin-bottom:12px}.admin-summary .card b{font-size:24px}.admin-findings{display:grid;gap:10px}.admin-finding{background:#0f161f;border:1px solid var(--line);border-radius:12px;padding:13px}.admin-finding.hot{border-color:#7c3f50;background:#21151c}.admin-finding.warn{border-color:#665b32;background:#1e1c15}.admin-finding.info{border-color:#285f6c}.admin-finding-head{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;flex-wrap:wrap}.admin-finding h3{font-size:18px;margin:1px 0 3px}.admin-priority{font-size:12px;font-weight:750;border:1px solid var(--line);padding:3px 8px;border-radius:999px}.admin-cause{font-size:16px;font-weight:700;margin:9px 0 3px}.admin-character{color:var(--muted);margin-bottom:8px}.admin-evidence{display:flex;gap:7px;flex-wrap:wrap;margin:8px 0}.admin-evidence span{background:#0b1118;border:1px solid #202c3a;border-radius:8px;padding:5px 8px;font-variant-numeric:tabular-nums}.admin-note{color:var(--muted);max-width:1050px}.admin-meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-top:5px}.admin-spikes{display:grid;grid-template-columns:repeat(3,minmax(240px,1fr));gap:9px}.admin-spike{background:#0f161f;border:1px solid var(--line);border-radius:10px;padding:11px}.admin-spike h3{font-size:14px;margin:0 0 5px}.admin-good{border:1px solid #285f6c;background:#102329;border-radius:10px;padding:11px;color:var(--good)}.admin-guide{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}.admin-guide>div{background:#0f161f;border:1px solid var(--line);border-radius:9px;padding:10px}.diagnosis-grid{display:grid;grid-template-columns:repeat(2,minmax(280px,1fr));gap:9px}.diag-card{background:#0f161f;border:1px solid var(--line);border-radius:10px;padding:11px}.diag-card.hot{border-color:#7c3f50;background:#21151c}.diag-card.warn{border-color:#665b32;background:#1e1c15}.diag-card.info{border-color:#285f6c}.diag-card h3{font-size:14px;margin:0 0 5px}.diag-value{font-size:19px;font-weight:700;margin:2px 0}.diag-text{color:var(--muted);margin-top:4px}.observer-note{border-color:#3c536b;background:#101923;color:var(--muted)}.observer-note b{color:var(--text)}.spike-grid{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:9px}.spike-card{background:#0f161f;border:1px solid var(--line);border-radius:10px;padding:11px}.spike-card h3{font-size:14px;margin:0 0 5px}.spike-stats{display:grid;grid-template-columns:repeat(5,minmax(76px,1fr));gap:6px;margin:8px 0}.spike-stats div{background:#0b1118;border:1px solid #202c3a;border-radius:7px;padding:6px}.spike-stats small{display:block;color:var(--muted)}.spike-shape{border:1px solid #665b32;background:#1e1c15;color:var(--warn);border-radius:7px;padding:7px 8px;margin:7px 0}.op-list{display:grid;gap:4px;margin-top:7px}.op-row{display:grid;grid-template-columns:minmax(110px,1.2fr) 70px repeat(4,minmax(70px,1fr));gap:6px;align-items:center;background:#0b1118;border:1px solid #202c3a;border-radius:7px;padding:5px 7px;font-size:12px}.op-row span:not(:first-child){text-align:right;font-variant-numeric:tabular-nums}.mode-split{margin-top:5px;padding:6px 7px;border:1px solid #285f6c;background:#101923;border-radius:7px;font-size:12px}.mode-split b{color:var(--accent)}.mode-pill{display:inline-block;margin:3px 5px 0 0;padding:2px 6px;border:1px solid #354d76;border-radius:999px;color:var(--low)}.sparkline{height:34px;display:flex;align-items:flex-end;gap:2px;margin-top:8px;padding:3px;background:#0b1118;border:1px solid #202c3a;border-radius:7px;overflow:hidden}.sparkbar{min-width:3px;flex:1;background:linear-gradient(180deg,var(--hot),var(--accent));border-radius:2px 2px 0 0}.spike-events{color:var(--muted);font-size:12px;margin-top:6px}.simple-issues{display:grid;grid-template-columns:repeat(2,minmax(300px,1fr));gap:10px}.simple-issue{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:12px}.simple-issue.hot{border-color:#7c3f50}.simple-issue h3{font-size:15px;margin:0 0 5px}.simple-load{font-size:22px;font-weight:700}.simple-why{margin:6px 0;color:var(--muted)}.simple-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.simple-actions button{appearance:none;border:1px solid var(--line);background:#101923;color:var(--text);padding:5px 8px;border-radius:7px;cursor:pointer}.simple-actions button:hover{border-color:var(--accent)}.plain-good{color:var(--good)}.plain-warn{color:var(--warn)}.plain-hot{color:var(--hot)}.simple-list{display:grid;gap:8px}.simple-device{display:grid;grid-template-columns:minmax(210px,1.4fr) 115px minmax(210px,1.3fr) minmax(230px,1.6fr);gap:10px;align-items:center;border-top:1px solid rgba(38,52,71,.6);padding:9px 0}.simple-device:first-child{border-top:0}.simple-device .where{color:var(--muted)}.simple-compare-summary{font-size:16px;margin:8px 0 12px}.simple-shell.hidden,.expert-shell.hidden{display:none}.mode-hint{color:var(--muted);font-size:12px;margin-top:4px}.simple-explain{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:8px}.simple-explain>div{background:#0f161f;border:1px solid var(--line);border-radius:9px;padding:10px}.type-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));gap:8px;margin-bottom:12px}.type-card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:10px}.type-card strong{display:block;font-size:17px;margin:2px 0}.type-card small{color:var(--muted)}.mini-actions{display:flex;gap:5px;justify-content:flex-end;flex-wrap:wrap}.mini-btn,.grid-link{appearance:none;border:1px solid var(--line);background:#101923;color:var(--text);padding:3px 7px;border-radius:6px;cursor:pointer;font-size:11px}.mini-btn:hover,.grid-link:hover{border-color:var(--accent)}.grid-link{color:var(--accent);white-space:nowrap}.coord-line{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.compare-toolbar{display:grid;grid-template-columns:minmax(230px,1.5fr) 170px 130px 130px 150px;gap:8px;align-items:end}.drop-zone{border:1px dashed #4b6688;border-radius:10px;padding:14px;background:#0d131b}.drop-zone.drag{border-color:var(--accent);background:#102329}.delta-up{color:var(--hot);font-weight:650}.delta-down{color:var(--good);font-weight:650}.delta-new{color:var(--warn);font-weight:650}.delta-gone{color:var(--muted);font-weight:650}.status-pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px}.compare-help{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px}.footer{margin-top:22px;color:var(--muted);font-size:12px}
+@media(max-width:1100px){.cards,.admin-summary{grid-template-columns:repeat(2,1fr)}.toolbar,.device-toolbar,.compare-toolbar{grid-template-columns:repeat(3,minmax(150px,1fr))}.dashboard-grid,.summary-wrap{grid-template-columns:1fr}.type-grid{grid-template-columns:repeat(2,1fr)}.simple-issues,.diagnosis-grid,.spike-grid{grid-template-columns:1fr}.simple-device{grid-template-columns:1fr 110px 1fr}.simple-device .simple-actions{grid-column:1/4}.simple-explain,.admin-spikes,.admin-guide{grid-template-columns:1fr}}
+@media(max-width:720px){.priority-item{grid-template-columns:1fr}.cards,.admin-summary{grid-template-columns:1fr}.toolbar,.device-toolbar,.compare-toolbar{grid-template-columns:1fr 1fr}.row{grid-template-columns:1fr 90px}.barbox{grid-column:1/3;grid-row:2}.calls{display:none}.mods,.type-grid{grid-template-columns:1fr}.data-table{min-width:760px}.simple-device{grid-template-columns:1fr}.simple-device .simple-actions{grid-column:auto}.simple-hero .big{font-size:24px}}
 </style>
 </head>
 <body>
 <main>
-<div class="top"><div><h1>Observable · AE2 Monitoring</h1><div id="reportMeta" class="meta"></div></div><div class="actions"><button id="simpleModeBtn" class="active">Простой режим</button><button id="expertModeBtn">Экспертный</button><button id="jsonBtn">Открыть JSON</button><button id="copyBtn">Копировать сводку</button></div></div>
+<div class="top"><div><h1>Observable · AE2 Monitoring</h1><div id="reportMeta" class="meta"></div></div><div class="actions"><button id="simpleModeBtn" class="active">Для администрации</button><button id="expertModeBtn">Экспертный</button><button id="jsonBtn">Открыть JSON</button><button id="copyBtn">Копировать сводку</button></div></div>
 <div id="simpleShell" class="simple-shell">
  <div id="simpleHero" class="simple-hero"></div>
- <div id="simpleCards" class="cards"></div>
- <section><div class="panel-head"><h2>Что profiler заметил сейчас</h2><span class="muted">baseline не нужен · current-only diagnosis</span></div><div id="simpleDiagnosis" class="diagnosis-grid"></div></section>
- <section><div class="panel-head"><h2>Spike Analysis</h2><span class="muted">Avg / percentiles / exact max · Distribution Modes · operation-aware · 20-tick timeline</span></div><div id="simpleSpikes" class="spike-grid"></div></section>
- <div class="dashboard-grid">
-  <section><div class="panel-head"><h2>Где лагает сильнее всего</h2><span class="muted">сети AE2 простыми словами</span></div><div id="simpleProblems" class="simple-issues"></div></section>
-  <section><div class="panel-head"><h2>Самые тяжёлые dimensions</h2><span class="muted">сумма AE2 Grid Core</span></div><div id="simpleDimensions"></div></section>
- </div>
- <section><div class="panel-head"><h2>Куда телепортироваться сначала</h2><span class="muted">конкретные физические устройства</span></div><div id="simpleDevices" class="simple-list"></div></section>
- <section>
-  <div class="panel-head"><h2>Сравнить с прошлым профилем</h2><span class="muted">покажет, что стало хуже или лучше</span></div>
-  <div class="drop-zone"><b>Выбери прошлый ae2-grid-....json</b><div class="muted">Файл читается только в браузере и никуда не отправляется.</div><input id="simpleCompareFile" type="file" accept=".json,application/json" style="margin-top:10px"></div>
-  <div id="simpleCompareMeta" class="meta"></div><div id="simpleCompare"></div>
- </section>
- <details class="advanced"><summary>Что означают эти цифры</summary><div class="advanced-body"><div class="simple-explain"><div><b>µs/t</b><br><span class="muted">Сколько микросекунд среднего серверного тика занял объект. 1000 µs/t = 1 ms/t.</span></div><div><b>Avg / call</b><br><span class="muted">Сколько в среднем стоит одно срабатывание устройства. Полезно для редких, но очень тяжёлых операций.</span></div><div><b>50 ms budget</b><br><span class="muted">При 20 TPS один серверный тик имеет бюджет 50 ms. Это только доля измеренной AE2-нагрузки, а не полный MSPT сервера.</span></div></div></div></details>
+ <div id="simpleCards" class="admin-summary"></div>
+ <section><div class="panel-head"><h2>Что требует внимания</h2><span class="muted">до 5 приоритетов · человеческий вывод из измерений</span></div><div id="adminFindings" class="admin-findings"></div></section>
+ <section><div class="panel-head"><h2>Редкие события</h2><span class="muted">отдельно от постоянной нагрузки · не считать причиной TPS без повторяемости</span></div><div id="adminSpikes" class="admin-spikes"></div></section>
+ <section><div class="panel-head"><h2>Как читать итог</h2><span class="muted">три правила для администрации</span></div><div class="admin-guide"><div><b>Приоритет</b><br><span class="muted">Показывает, куда смотреть в отчёте сначала. Это triage, а не автоматический вердикт о виновнике TPS.</span></div><div><b>Характер нагрузки</b><br><span class="muted">Повторяющаяся работа отделена от единичных дорогих событий, чтобы один spike не выглядел как постоянный лаг.</span></div><div><b>Уверенность</b><br><span class="muted">Высокая — причина хорошо видна в измеренных buckets. Низкая — большая часть времени остаётся в inclusive/remainder и требует экспертного разбора.</span></div></div></section>
+ <details class="advanced"><summary>Сравнить с прошлым профилем</summary><div class="advanced-body"><div class="drop-zone"><b>Выбери прошлый ae2-grid-....json</b><div class="muted">Файл читается только в браузере и никуда не отправляется.</div><input id="simpleCompareFile" type="file" accept=".json,application/json" style="margin-top:10px"></div><div id="simpleCompareMeta" class="meta"></div><div id="simpleCompare"></div></div></details>
+ <details class="advanced"><summary>Технические оговорки</summary><div class="advanced-body"><div class="simple-explain"><div><b>Grid Core</b><br><span class="muted">На больших серверах global Grid Core после Top-N freeze является 4-tick scout estimate. Это не полный MSPT сервера.</span></div><div><b>µs/t</b><br><span class="muted">1000 µs/t = 1 ms среднего серверного тика. Nested значения внутри одной Grid нельзя складывать.</span></div><div><b>Physical</b><br><span class="muted">Physical timing остаётся exact/full-profile. Per-Grid physical aggregate в compact отчёте — нижняя граница, если часть мелких targets omitted.</span></div></div></div></details>
 </div>
 
 <div id="expertShell" class="expert-shell hidden">
@@ -1302,14 +1603,15 @@ details.advanced{padding:0;overflow:hidden}details.advanced>summary{cursor:point
 <div id="page-overview" class="page">
  <div id="globalCards" class="cards"></div>
  <section><div class="panel-head"><h2>Current diagnosis</h2><span class="muted">single-profile heuristics · no baseline required</span></div><div id="currentDiagnosis" class="diagnosis-grid"></div></section>
+ <section><div class="panel-head"><h2>Diagnostic priorities</h2><span class="muted">ranked evidence from existing report data · no extra injection points</span></div><div id="diagnosticPriorities" class="priority-list"></div></section>
  <section><div class="panel-head"><h2>Spike Analysis</h2><span class="muted">sample-derived Distribution Modes + operation-aware distributions; no new AE2 injection points</span></div><div id="spikeSummary" class="spike-grid"></div></section>
  <div class="dashboard-grid">
   <div class="panel"><div class="panel-head"><h2>Top AE2 Grids</h2><span class="muted">клик → открыть Grid</span></div><div id="topGrids"></div></div>
-  <div class="panel"><div class="panel-head"><h2>Dimensions</h2><span class="muted">Σ Grid Core</span></div><div id="dimensionSummary"></div></div>
+  <div class="panel"><div class="panel-head"><h2>Dimensions</h2><span class="muted">Top-N detail · global total above</span></div><div id="dimensionSummary"></div></div>
  </div>
  <section><div class="panel-head"><h2>Top physical AE2 devices</h2><span class="muted">отдельные timing buckets; не прибавлять к Grid Core</span></div><div id="topDevices"></div></section>
   <div class="dashboard-grid">
-   <div class="panel"><div class="panel-head"><h2>Physical load by Grid</h2><span class="muted">Σ physical timing targets</span></div><div id="physicalByGrid"></div></div>
+   <div class="panel"><div class="panel-head"><h2>Physical load by Grid</h2><span class="muted">exported targets · conservative lower bound when compact</span></div><div id="physicalByGrid"></div></div>
    <div class="panel"><div class="panel-head"><h2>Device types</h2><span class="muted">Σ load / count / avg call</span></div><div id="hotspotTypes"></div></div>
   </div>
 </div>
@@ -1319,7 +1621,7 @@ details.advanced{padding:0;overflow:hidden}details.advanced>summary{cursor:point
   <div class="field"><label for="gridSearch">Поиск Grid / dimension / координаты</label><input id="gridSearch" type="search" placeholder="например: #82, overworld, ps_adobeaudition, -23 64 6"></div>
   <div class="field"><label for="gridDimension">Dimension</label><select id="gridDimension"></select></div>
   <div class="field"><label for="gridMin">Минимум Core, µs/t</label><input id="gridMin" type="number" min="0" step="0.1" value="5"></div>
-  <div class="field"><label for="gridSort">Сортировка</label><select id="gridSort"><option value="core">Grid Core</option><option value="devices">Devices</option><option value="scheduler">Scheduler</option><option value="overhead">Grid remainder*</option><option value="services">Services</option><option value="dispatch">Level dispatch</option><option value="foreign">Foreign dispatch</option></select></div>
+  <div class="field"><label for="gridSort">Сортировка</label><select id="gridSort"><option value="priority">Диагностический приоритет</option><option value="core">Grid Core</option><option value="devices">Devices</option><option value="scheduler">Scheduler</option><option value="overhead">Grid remainder*</option><option value="services">Services</option><option value="dispatch">Level dispatch</option><option value="foreign">Foreign dispatch</option></select></div>
   <div class="field"><label for="gridTop">Показывать</label><select id="gridTop"><option value="10">Top 10</option><option value="25">Top 25</option><option value="50" selected>Top 50</option><option value="100">Top 100</option><option value="0">Все</option></select></div>
   <label class="check"><input id="gridActive" type="checkbox"> Только с Devices</label>
   <button id="gridShowAll">Показать все</button>
@@ -1335,7 +1637,7 @@ details.advanced{padding:0;overflow:hidden}details.advanced>summary{cursor:point
   <div class="field"><label for="deviceSearch">Поиск type / dimension / координаты</label><input id="deviceSearch" type="search" placeholder="например: ae2:drive, Grid #50, ps_adobeaudition, 10 64 -3"></div>
   <div class="field"><label for="deviceDimension">Dimension</label><select id="deviceDimension"></select></div>
   <div class="field"><label for="deviceMin">Минимум, µs/t</label><input id="deviceMin" type="number" min="0" step="0.1" value="0"></div>
-  <div class="field"><label for="deviceSort">Сортировка</label><select id="deviceSort"><option value="time">Нагрузка</option><option value="avg">Avg / call</option><option value="calls">Calls/t</option><option value="p99">P99 / call</option><option value="max">Max / call</option><option value="type">Тип</option></select></div>
+  <div class="field"><label for="deviceSort">Сортировка</label><select id="deviceSort"><option value="priority">Диагностический приоритет</option><option value="time">Нагрузка</option><option value="avg">Avg / call</option><option value="calls">Calls/t</option><option value="p99">P99 / call</option><option value="max">Max / call</option><option value="type">Тип</option></select></div>
   <div class="field"><label for="deviceTop">Показывать</label><select id="deviceTop"><option value="25">Top 25</option><option value="50" selected>Top 50</option><option value="100">Top 100</option><option value="0">Все</option></select></div>
   <button id="deviceShowAll">Показать все</button>
  </div>
@@ -1359,14 +1661,14 @@ details.advanced{padding:0;overflow:hidden}details.advanced>summary{cursor:point
  </div>
  <div id="compareCards" class="cards"></div>
  <section><div class="panel-head"><h2>Regression intelligence</h2><span class="muted">calls/tick vs cost/call + topology diff; correlation ≠ causation</span></div><div id="compareInsights"><div class="empty">Выбери baseline JSON.</div></div></section>
- <section><div class="panel-head"><h2>AE2 Grid changes</h2><span class="muted">match: unique anchor first, duplicate/changed anchor → device fingerprint</span></div><div id="compareGridList"><div class="empty">Выбери baseline JSON.</div></div></section>
+ <section><div class="panel-head"><h2>AE2 Grid changes</h2><span class="muted">runtime Top-N detail · Grid totals may be scout estimate</span></div><div id="compareGridList"><div class="empty">Выбери baseline JSON.</div></div></section>
  <section><div class="panel-head"><h2>Physical device changes</h2><span class="muted">match: dimension + type + coordinates</span></div><div id="compareDeviceList"><div class="empty">Выбери baseline JSON.</div></div></section>
 </div>
 </div>
 
 """);
         html.append("""
-<div class="footer">Observable AE2 v20.3.2.7 Typed Cell Owner Resolution + Drive Owner Mapping + Drive Coverage Diagnostics + Profiler Correctness + Large Server Safety + Distribution Modes + Operation-aware Spike Analysis + Current Diagnosis + Regression Intelligence. Spike Analysis adds P50/P95/P99, exact max, worst-call tick offsets, and compact 20-tick timelines for compat-wrapped physical calls. It is diagnostic-only and does not optimize or change AE2. Moderator TP uses /observable tp.</div>
+<div class="footer">Observable AE2 v20.5.3 Administration Consistency Guard + v20.5.2 Administration Accuracy + human-readable triage + retained v20.4.1 Diagnostic Intelligence + Physical Grid Aggregate + Secondary Foreign Dispatch + Robust Burst Detection + v20.3.2.16 Drive Hot Path Cache + ExtendedAE Drive Mount Ownership + Runtime Top-N + Compact Reports + Large Server Safety + Profiler Correctness + Distribution Modes + Regression Intelligence. Regular /observable run does not collect AE2 detail. Use /observable ae2 run &lt;seconds&gt; or /observable ae2 &lt;grids&gt; run &lt;seconds&gt;. After a 4-tick scout only Top-N grids keep full runtime detail; Grid global totals are scout-estimated when the cap freezes, while physical totals remain full-profile. Moderator TP uses /observable tp.</div>
 </main>
 <script id="ae2-data" type="application/json">
 __REPORT_JSON__
@@ -1377,7 +1679,13 @@ __REPORT_JSON__
 const report=JSON.parse(document.getElementById('ae2-data').textContent);
 const allGrids=[...(report.grids||[])];
 const allDevices=[...(report.physicalDevices||[])];
+const reportLimits=report.reportLimits||{};
+const globalTotals=report.globalTotals||{};
+const runtimeSelection=report.runtimeSelection||{};
 const n=v=>Number.isFinite(Number(v))?Number(v):0;
+const globalValue=(key,fallback)=>Number.isFinite(Number(globalTotals?.[key]))?n(globalTotals[key]):fallback;
+const observedPhysicalCount=()=>globalValue('observedPhysicalDevices',allDevices.length);
+const globalPhysicalTotal=()=>globalValue('physicalUsPerTick',allDevices.reduce((a,d)=>a+n(d.metric?.usPerTick),0));
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt=v=>{v=n(v);return `${v>=100?v.toFixed(1):v>=10?v.toFixed(2):v.toFixed(3)} µs/t`};
 const calls=v=>`${n(v)>=10?n(v).toFixed(1):n(v).toFixed(3)}x/t`;
@@ -1396,7 +1704,7 @@ function spikeTimelineHtml(d){const tl=spikeOf(d)?.timeline||[];if(!tl.length)re
 function spikeEventsText(d){const ev=spikeOf(d)?.topEvents||[];return ev.length?ev.slice(0,5).map(x=>`t+${n(x.tick)}: ${fmtCall(n(x.us))}`).join(' · '):'нет captured spike events'}
 function operationLabel(name){name=String(name||'unknown');if(name.startsWith('drive.'))return `Drive ${name.slice(6)}`;if(name==='tick')return 'AE2 tick';if(name==='unknown'||name==='other')return name;return `Tick modulation ${name}`}
 function spikeOperationHtml(d){const ops=spikeOps(d);if(!ops.length)return '';const rows=ops.slice(0,8).map(o=>`<div><div class="op-row"><b>${esc(operationLabel(o.name))}</b><span>n=${n(o.callsSeen).toLocaleString()}</span><span title="Avg">${fmtCall(o.avgUs)}</span><span title="P50">${fmtCall(o.p50Us)}</span><span title="P95">${fmtCall(o.p95Us)}</span><span title="Max">${fmtCall(o.maxUs)}</span></div>${spikeModesHtml(o)}</div>`).join('');const more=ops.length>8?`<div class="mode-hint">+${ops.length-8} operation groups</div>`:'';return `<div class="mode-hint">Operation breakdown: Avg · P50 · P95 · Max</div><div class="op-list">${rows}</div>${more}`}
-function spikeCardHtml(d){const s=spikeOf(d),avg=avgCallUs(d.metric),shape=spikeShape(s,avg);return `<div class="spike-card"><h3>${esc(humanType(d.type))} · ${esc(dimShort(d.dimension))} @ ${esc(posText(d.position))}</h3><div class="spike-stats"><div><small>Avg</small><b>${fmtCall(avg)}</b></div><div><small>P50</small><b>${fmtCall(s.p50Us)}</b></div><div><small>P95</small><b>${fmtCall(s.p95Us)}</b></div><div><small>P99</small><b>${fmtCall(s.p99Us)}</b></div><div><small>Exact max</small><b>${fmtCall(s.maxUs)}</b></div></div>${shape?`<div class="spike-shape">${esc(shape)}</div>`:''}${spikeModesHtml(s)}${spikeTimelineHtml(d)}<div class="spike-events">${esc(spikeEventsText(d))}</div><div class="mode-hint">${esc(spikeSampleNote(d))}${s.timelineTruncated?' · timeline truncated':''}${s.operationOverflow?' · operation groups capped':''}</div>${spikeOperationHtml(d)}<div class="simple-actions">${coordActions(d.dimension,d.position)}${d.gridLabel?`<button data-open-grid="${esc(d.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}
+function spikeCardHtml(d){const s=spikeOf(d),avg=avgCallUs(d.metric),shape=spikeShape(s,avg);return `<div class="spike-card"><h3>${esc(humanType(d.type))} · ${esc(dimShort(d.dimension))} @ ${esc(posText(d.position))}</h3><div class="spike-stats"><div><small>Avg</small><b>${fmtCall(avg)}</b></div><div><small>P50</small><b>${fmtCall(s.p50Us)}</b></div><div><small>P95</small><b>${fmtCall(s.p95Us)}</b></div><div><small>P99</small><b>${fmtCall(s.p99Us)}</b></div><div><small>Exact max</small><b>${fmtCall(s.maxUs)}</b></div></div>${shape?`<div class="spike-shape">${esc(shape)}</div>`:''}${spikeModesHtml(s)}${spikeTimelineHtml(d)}<div class="spike-events">${esc(spikeEventsText(d))}</div><div class="mode-hint">${esc(spikeSampleNote(d))}${s.timelineTruncated?' · timeline truncated':''}${s.operationOverflow?' · operation groups capped':''}</div>${spikeOperationHtml(d)}<div class="simple-actions">${coordActions(d.dimension,d.position)}${d.gridLabel&&gridByLabel(d.gridLabel)?`<button data-open-grid="${esc(d.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}
 function spikeCandidates(limit=6){return allDevices.filter(d=>n(spikeOf(d)?.callsSeen)>0).sort((a,b)=>spikeVal(b,'maxUs')-spikeVal(a,'maxUs')||spikeVal(b,'p99Us')-spikeVal(a,'p99Us')).slice(0,limit)}
 function renderSpikeAnalysis(){const ds=spikeCandidates(6),html=ds.length?ds.map(spikeCardHtml).join(''):'<div class="empty">В этом профиле ещё нет captured physical-call spike samples.</div>';const a=document.getElementById('simpleSpikes'),b=document.getElementById('spikeSummary');if(a)a.innerHTML=html;if(b)b.innerHTML=html}
 const dimShort=d=>{d=String(d||'unknown');const p=d.lastIndexOf('/');return p>=0?d.slice(p+1):d};
@@ -1405,9 +1713,9 @@ const anchorText=g=>posText(g?.anchor);
 const gridByLabel=label=>allGrids.find(g=>g.label===label)||null;
 const tpCommand=(dimension,p)=>p?`/observable tp ${dimension} position ${n(p.x)} ${n(p.y)} ${n(p.z)}`:'';
 const coordActions=(dimension,p)=>p?`<span class="mini-actions"><button class="mini-btn" data-copy-text="${esc(posText(p))}">Copy coords</button><button class="mini-btn" data-copy-text="${esc(tpCommand(dimension,p))}">Copy TP</button></span>`:'';
-const gridLink=label=>label?`<button class="grid-link" data-open-grid="${esc(label)}">${esc(label)}</button>`:'<span class="muted">unlinked</span>';
-const dispatchTotal=g=>(g?.tickManager?.dispatchLevels||[]).reduce((a,x)=>a+n(x.total?.usPerTick),0);
-const foreignDispatch=g=>(g?.tickManager?.dispatchLevels||[]).filter(x=>!x.anchorDimension).reduce((a,x)=>a+n(x.total?.usPerTick),0);
+const gridLink=label=>label?(gridByLabel(label)?`<button class="grid-link" data-open-grid="${esc(label)}">${esc(label)}</button>`:`<span class="muted" title="Grid has physical targets but was not exported by runtime Top-N detail">${esc(label)} · physical-only</span>`):'<span class="muted">unlinked</span>';
+const dispatchTotal=g=>Number.isFinite(Number(g?.tickManager?.dispatchLevelsAggregate?.usPerTick))?n(g.tickManager.dispatchLevelsAggregate.usPerTick):(g?.tickManager?.dispatchLevels||[]).reduce((a,x)=>a+n(x.total?.usPerTick),0);
+const foreignDispatch=g=>Number.isFinite(Number(g?.tickManager?.foreignDispatchAggregate?.usPerTick))?n(g.tickManager.foreignDispatchAggregate.usPerTick):(g?.tickManager?.dispatchLevels||[]).filter(x=>!x.anchorDimension).reduce((a,x)=>a+n(x.total?.usPerTick),0);
 const valueOf=(g,kind)=>{if(!g)return 0;switch(kind){case'devices':return n(g.metrics?.devices?.usPerTick);case'scheduler':return n(g.tickManager?.schedulerRemainder?.usPerTick);case'overhead':return n(g.metrics?.gridOverhead?.usPerTick);case'services':return n(g.metrics?.gridServices?.usPerTick);case'dispatch':return dispatchTotal(g);case'foreign':return foreignDispatch(g);default:return n(g.metrics?.gridCore?.usPerTick)}};
 const severity=v=>v>=100?['HOT','sev-hot']:v>=25?['HIGH','sev-warn']:v>=5?['MID','sev-mid']:['LOW','sev-low'];
 const badge=v=>{const [t,c]=severity(n(v));return `<span class="badge ${c}">${t}</span>`};
@@ -1422,7 +1730,7 @@ const gridState={q:'',dimension:'*',min:5,sort:'core',top:50,active:false};
 const deviceState={q:'',dimension:'*',min:0,sort:'time',top:50};
 let baselineReport=null;let baselineName='';
 const compareState={kind:'all',sort:'delta',minPct:10,minAbs:0,top:100};
-const UI_STORAGE_KEY='observable-ae2-v20-ui';
+const UI_STORAGE_KEY='observable-ae2-v20.5.3-ui';
 
 function switchView(view,persist=true){currentView=view;document.querySelectorAll('.page').forEach(p=>p.classList.toggle('hidden',p.id!==`page-${view}`));document.querySelectorAll('.nav-tabs button').forEach(b=>b.classList.toggle('active',b.dataset.view===view));if(view==='overview')renderOverview();if(view==='grids')applyGridFilters(false);if(view==='devices')applyDeviceFilters(false);if(view==='compare')renderCompare();if(persist)saveUiState()}
 function setSiteMode(mode,persist=true){siteMode=mode==='expert'?'expert':'simple';document.getElementById('simpleShell').classList.toggle('hidden',siteMode!=='simple');document.getElementById('expertShell').classList.toggle('hidden',siteMode!=='expert');document.getElementById('simpleModeBtn').classList.toggle('active',siteMode==='simple');document.getElementById('expertModeBtn').classList.toggle('active',siteMode==='expert');if(siteMode==='simple')renderSimple();else switchView(currentView,false);if(persist)saveUiState()}
@@ -1430,24 +1738,129 @@ function populateDimensionSelect(id,values){const el=document.getElementById(id)
 const pctText=(v,total)=>total>0?`${(n(v)/total*100).toFixed(n(v)/total*100>=10?1:2)}%`:'—';
 const gridKey=g=>`${g?.dimension||'unknown'}|${n(g?.anchor?.x)},${n(g?.anchor?.y)},${n(g?.anchor?.z)}`;
 const deviceKey=d=>`${d?.dimension||'unknown'}|${d?.type||'unknown'}|${n(d?.position?.x)},${n(d?.position?.y)},${n(d?.position?.z)}`;
-const HUMAN_TYPES={'ae2:export_bus':'Шина экспорта AE2','ae2:import_bus':'Шина импорта AE2','ae2:storage_bus':'Шина хранения AE2','ae2:drive':'ME Drive','ae2:charger':'Зарядник AE2','ae2:dense_energy_cell':'Плотная энергетическая ячейка','ae2:energy_cell':'Энергетическая ячейка','expatternprovider:tag_export_bus':'Tag Export Bus','expatternprovider:ex_export_bus_part':'Extended Export Bus','expatternprovider:ex_import_bus_part':'Extended Import Bus','expatternprovider:oversize_interface':'Oversize Interface'};
+const HUMAN_TYPES={'ae2:export_bus':'Шина экспорта AE2','ae2:import_bus':'Шина импорта AE2','ae2:storage_bus':'Шина хранения AE2','ae2:drive':'ME Drive','ae2:charger':'Зарядник AE2','ae2:dense_energy_cell':'Плотная энергетическая ячейка','ae2:energy_cell':'Энергетическая ячейка','expatternprovider:tag_export_bus':'Tag Export Bus','expatternprovider:ex_drive':'ExtendedAE Drive','expatternprovider:ex_export_bus_part':'Extended Export Bus','expatternprovider:ex_import_bus_part':'Extended Import Bus','expatternprovider:oversize_interface':'Oversize Interface'};
 const humanType=t=>HUMAN_TYPES[t]||String(t||'unknown').replace(/^ae2:/,'AE2 ').replace(/^expatternprovider:/,'ExtendedAE ').replace(/_/g,' ');
 const ms=v=>`${(n(v)/1000).toFixed(n(v)>=10000?1:2)} ms/t`;
 const tickBudgetPct=v=>n(v)/50000*100;
 function simpleGrade(v){const p=tickBudgetPct(v);return p>=10?['Высокая нагрузка','plain-hot']:p>=4?['Заметная нагрузка','plain-warn']:['Умеренная нагрузка','plain-good']}
 function physicalForGrid(label,devices=allDevices){return devices.filter(d=>d.gridLabel===label).sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick))}
 function deviceFrequencyText(d){const c=n(d?.metric?.callsPerTick),avg=avgCallUs(d?.metric);if(c<=0)return 'За этот профиль не срабатывало.';if(c<0.05&&avg>=1000)return `Срабатывает редко, но один вызов тяжёлый: ${fmtCall(avg)}.`;if(c>=0.8)return `Работает почти каждый тик; одно срабатывание ${fmtCall(avg)}.`;if(c<0.1)return `Срабатывает примерно раз в ${Math.max(1,Math.round(1/c))} тиков; одно срабатывание ${fmtCall(avg)}.`;return `Срабатывает ${calls(c)}; одно срабатывание ${fmtCall(avg)}.`}
-function dispatchStats(g){const levels=g?.tickManager?.dispatchLevels||[],anchor=levels.filter(x=>x.anchorDimension),foreign=levels.filter(x=>!x.anchorDimension),sum=arr=>arr.reduce((a,x)=>a+n(x.total?.usPerTick),0);return{levels:levels.length,anchorCount:anchor.length,foreignCount:foreign.length,anchorLoad:sum(anchor),foreignLoad:sum(foreign)}}
+function dispatchStats(g){const tm=g?.tickManager||{},levels=tm.dispatchLevels||[],anchor=levels.filter(x=>x.anchorDimension),foreign=levels.filter(x=>!x.anchorDimension),sum=arr=>arr.reduce((a,x)=>a+n(x.total?.usPerTick),0),totalLevels=Number.isFinite(Number(tm.dispatchLevelsTotal))?n(tm.dispatchLevelsTotal):levels.length;return{levels:totalLevels,shown:levels.length,omitted:Math.max(0,totalLevels-levels.length),anchorCount:anchor.length,foreignCount:foreign.length,anchorLoad:Number.isFinite(Number(tm.dispatchLevelsAggregate?.usPerTick))?Math.max(0,n(tm.dispatchLevelsAggregate.usPerTick)-n(tm.foreignDispatchAggregate?.usPerTick)):sum(anchor),foreignLoad:Number.isFinite(Number(tm.foreignDispatchAggregate?.usPerTick))?n(tm.foreignDispatchAggregate.usPerTick):sum(foreign)}}
 function physicalConcentration(g,topN=5){const active=physicalForGrid(g?.label).filter(d=>n(d.metric?.usPerTick)>0),physicalTotal=active.reduce((a,d)=>a+n(d.metric?.usPerTick),0),top=active.slice(0,topN),topTotal=top.reduce((a,d)=>a+n(d.metric?.usPerTick),0),devices=valueOf(g,'devices');return{activeCount:active.length,physicalTotal,top,topCount:top.length,topTotal,physicalShare:physicalTotal>0?topTotal/physicalTotal*100:0,devicesShare:devices>0?topTotal/devices*100:0}}
 function observerRisk(g){const callsPerTick=n(g?.metrics?.gridCore?.callsPerTick),remainder=valueOf(g,'overhead'),core=valueOf(g,'core'),ratio=core>0?remainder/core*100:0;let level='low';if(callsPerTick>=80&&remainder>=25)level='elevated';else if(callsPerTick>=40&&remainder>=10)level='possible';return{level,callsPerTick,remainder,ratio}}
 function observerRiskText(r){return r.level==='elevated'?'повышенный':r.level==='possible'?'возможный':'низкий'}
 function observerRiskClass(r){return r.level==='elevated'?'plain-warn':r.level==='possible'?'plain-warn':'plain-good'}
-function simpleGridCause(g){const devices=valueOf(g,'devices'),scheduler=valueOf(g,'scheduler'),overhead=valueOf(g,'overhead');const top=[['работа устройств сети',devices],['планировщик AE2',scheduler],['Grid remainder',overhead]].sort((a,b)=>b[1]-a[1])[0],pd=physicalForGrid(g.label)[0],conc=physicalConcentration(g);let text=`Основная измеренная часть — ${top[0]} (${fmt(top[1])}).`;if(conc.activeCount>=5&&conc.physicalShare>=70&&conc.physicalTotal>=1)text+=` Top ${conc.topCount} physical targets дают ${conc.physicalShare.toFixed(1)}% их измеренной physical load.`;if(pd&&n(pd.metric?.usPerTick)>=1){text+=` Самый тяжёлый объект: ${humanType(pd.type)} (${fmt(pd.metric?.usPerTick)}).`;if(n(pd.metric?.callsPerTick)>0&&n(pd.metric?.callsPerTick)<0.1&&avgCallUs(pd.metric)>=500)text+=` Это редкий дорогой вызов: ${fmtCall(avgCallUs(pd.metric))}.`}return text}
-function currentDiagnosisItems(){const items=[];const sm=report.sampling||{};if(sm.largeServerMode){const budget=n(sm.skippedByBudget);items.push({level:budget>0?'warn':'info',title:'Large Server sampling',value:`~1/${n(sm.effectiveSampleFactor).toFixed(1)} Level callbacks · max ${n(sm.maxSampleFactor)}x`,text:`Observed ${n(sm.levelLifecycleCallbacksSeenPerProfileTick).toFixed(0)} Level lifecycle callbacks/profile tick; detailed sampled ${n(sm.levelLifecycleCallbacksSampledPerProfileTick).toFixed(0)}/tick. Physical device timing remains exact.${budget>0?` Safety budget skipped ${budget.toLocaleString()} callbacks; Grid/service estimates are conservative.`:''}`})}const dc=report.driveCoverage||{};if(Object.keys(dc).length){const r=dc.resolver||{},o=dc.operations||{},miss=n(o.unresolvedBegins),uw=n(r.unresolvedWatchers),active=n(dc.activeDriveTargets),total=n(dc.physicalDriveTargets);items.push({level:(miss>0||uw>0)?'warn':'info',title:'ME Drive coverage',value:`${active}/${total} active · ${miss.toLocaleString()} unresolved ops`,text:`Watcher cache: ${n(r.resolvedWatchers)} resolved / ${uw} unresolved; pre-map ${n(r.resolvedByHostMapping)}, typed-cell ${n(r.resolvedByCellSaveProvider)}, direct ${n(r.resolvedByDirectOwner)}, callback-capture ${n(r.resolvedByCallbackCapture)}. Typed-cell attempts ${n(r.typedCellResolutionAttempts)}; Basic delegates ${n(r.cellDelegateTypeBasic)}, other delegates ${n(r.cellDelegateTypeOther)}, null ${n(r.cellDelegateNull)}, delegate-access failures ${n(r.cellDelegateAccessFailures)}, save-provider failures ${n(r.cellSaveProviderAccessFailures)}, capture misses ${n(r.cellSaveProviderCaptureMisses)}. Begin calls: extract ${n(o.beginExtract).toLocaleString()}, insert ${n(o.beginInsert).toLocaleString()}, preferred ${n(o.beginPreferred).toLocaleString()}, availableStacks ${n(o.beginAvailableStacks).toLocaleString()}. Safe-skip reasons: no-accessor ${n(r.unresolvedReasons?.noOwnerAccessors)}, no-captured-drive ${n(r.unresolvedReasons?.noCapturedDrive)}, safety-reject ${n(r.unresolvedReasons?.safetyReject)}, access-failure ${n(r.unresolvedReasons?.accessFailure)}, direct-not-drive ${n(r.unresolvedReasons?.directOwnerNotDrive)}.`})}const rare=allDevices.filter(d=>n(d.metric?.callsPerTick)>0&&n(d.metric?.callsPerTick)<0.1&&avgCallUs(d.metric)>=500&&n(d.metric?.usPerTick)>=0.25).sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick));if(rare.length){const d=rare[0],extra=rare.length>1?` Ещё таких targets: ${rare.length-1}.`:'';items.push({level:avgCallUs(d.metric)>=2000?'hot':'warn',title:'Редкий дорогой вызов',value:`${fmtCall(avgCallUs(d.metric))} · ${fmt(d.metric?.usPerTick)}`,text:`${humanType(d.type)} · ${dimShort(d.dimension)} @ ${posText(d.position)} · ${calls(d.metric?.callsPerTick)}.${extra}`})}const spiky=allDevices.filter(d=>spikeVal(d,'maxUs')>0&&spikeVal(d,'p95Us')>0).map(d=>({d,ratio:spikeVal(d,'maxUs')/Math.max(1,spikeVal(d,'p50Us'))})).sort((a,b)=>spikeVal(b.d,'maxUs')-spikeVal(a.d,'maxUs'));if(spiky.length){const {d,ratio}=spiky[0],sp=spikeOf(d),shape=spikeShape(sp,avgCallUs(d.metric));items.push({level:sp.maxUs>=5000?'warn':'info',title:'Spike distribution',value:`P99 ${fmtCall(sp.p99Us)} · max ${fmtCall(sp.maxUs)}`,text:`${humanType(d.type)} @ ${posText(d.position)} · Avg ${fmtCall(avgCallUs(d.metric))} · max/P50 ×${ratio.toFixed(1)} · worst tick t+${n(sp.maxTick)}. ${spikeSampleNote(d)}.${shape?' '+shape:''}`})}const concs=allGrids.map(g=>({g,c:physicalConcentration(g)})).filter(x=>x.c.activeCount>=5&&x.c.physicalTotal>=1&&x.c.physicalShare>=70).sort((a,b)=>b.c.topTotal-a.c.topTotal);if(concs.length){const {g,c}=concs[0],deviceShare=c.devicesShare>0&&c.devicesShare<=125?` Это ≈${c.devicesShare.toFixed(1)}% Grid devices bucket.`:'';items.push({level:c.physicalShare>=90?'hot':'warn',title:'Нагрузка сконцентрирована',value:`Top ${c.topCount} = ${c.physicalShare.toFixed(1)}% physical`,text:`${g.label} · ${dimShort(g.dimension)}. ${fmt(c.topTotal)} из ${fmt(c.physicalTotal)} physical targets.${deviceShare}`})}const dispatch=allGrids.map(g=>({g,s:dispatchStats(g)})).filter(x=>x.s.foreignCount>=5&&x.s.foreignLoad>=1).sort((a,b)=>b.s.foreignLoad-a.s.foreignLoad);if(dispatch.length){const {g,s}=dispatch[0];items.push({level:s.foreignLoad>=25?'warn':'info',title:'Foreign Level dispatch',value:`${s.foreignCount} foreign levels · ${fmt(s.foreignLoad)}`,text:`${g.label}: anchor ${s.anchorCount} level / ${fmt(s.anchorLoad)}. Это диагностический fan-out, а не автоматическое доказательство бага AE2.`})}const risks=allGrids.map(g=>({g,r:observerRisk(g)})).filter(x=>x.r.level!=='low').sort((a,b)=>b.r.remainder-a.r.remainder);if(risks.length){const {g,r}=risks[0];items.push({level:'info',title:'Observer-risk для Grid remainder',value:`${observerRiskText(r)} · ${fmt(r.remainder)}`,text:`${g.label}: ${calls(r.callsPerTick)} Grid lifecycle calls. Remainder = Grid Core − Services и может содержать реальную AE2-работу плюс instrumentation; это риск-оценка, не измерение self-time.`})}if(!items.length)items.push({level:'info',title:'Явных current-only hotspots нет',value:'Нормальный профиль',text:'Пороговые эвристики не нашли редких дорогих вызовов, сильной концентрации physical load или заметного foreign dispatch.'});return items}
+function simpleGridCause(g){const gp=gridPattern(g),pd=physicalForGrid(g.label)[0],conc=physicalConcentration(g);let text=`${gp.label}: ${gp.reason}`;if(conc.activeCount>=5&&conc.physicalShare>=70&&conc.physicalTotal>=1)text+=` Top ${conc.topCount} physical targets дают ${conc.physicalShare.toFixed(1)}% их измеренной physical load.`;if(pd&&n(pd.metric?.usPerTick)>=1){const dp=devicePattern(pd);text+=` Самый заметный physical target: ${humanType(pd.type)} (${fmt(pd.metric?.usPerTick)}; ${dp.label.toLowerCase()}).`}return text}
+function devicePattern(d){
+ const load=n(d?.metric?.usPerTick),c=n(d?.metric?.callsPerTick),metricCalls=n(d?.metric?.calls),avg=avgCallUs(d?.metric),totalUs=n(d?.metric?.totalNanos)/1000,sp=spikeOf(d),seen=n(sp?.callsSeen),p50=n(sp?.p50Us),p95=n(sp?.p95Us),p99=n(sp?.p99Us),max=n(sp?.maxUs),modes=sp?.modes||[];
+ const maxShare=totalUs>0?Math.min(1,max/totalUs):0;
+ const rareBurst=max>=1000&&seen>0&&(seen<=8||c<0.15);
+ const largeOutlier=max>=1000&&seen>0&&(maxShare>=0.20||(p99>0&&max>=Math.max(5000,p99*20)));
+ const typicalAvg=largeOutlier&&metricCalls>1?Math.max(0,totalUs-max)/Math.max(1,metricCalls-1):avg;
+ let key='mixed',label='Смешанная',level='info',confidence='medium',reason=`${fmt(load)} · ${calls(c)} · Avg ${fmtCall(avg)}`;
+ if(c>=100&&typicalAvg<1){key='throughput';label='Высокий поток дешёвых calls';level=load>=100?'warn':'info';confidence='high';reason=largeOutlier?`${calls(c)}, typical без top max ≈ ${fmtCall(typicalAvg)} (Avg с outlier ${fmtCall(avg)}); основная работа — большой поток дешёвых вызовов.`:`${calls(c)}, Avg ${fmtCall(avg)}; нагрузка создаётся объёмом вызовов, а не ценой одного.`}
+ if(key!=='throughput'&&c>=0.5&&load>=10&&typicalAvg>=1){key='sustained';label='Постоянная нагрузка';level=load>=100?'hot':'warn';confidence='high';reason=`${calls(c)}, typical ${fmtCall(typicalAvg)}; вклад повторяется регулярно.`}
+ if(c>0&&c<0.25&&avg>=250){key='rare-costly';label='Редкий дорогой call';level=avg>=1000?'warn':'info';confidence='high';reason=`${calls(c)}, Avg ${fmtCall(avg)}; средний µs/t невысок из-за редкой частоты.`}
+ if(rareBurst){key='burst';label='Редкий spike';level=max>=5000?'hot':'warn';confidence='high';reason=`${seen.toLocaleString()} calls за профиль (${calls(c)}), max ${fmtCall(max)}; средняя нагрузка ${fmt(load)} скрывает редкий stall.`}
+ if(key!=='burst'&&modes.length>=2){key='bimodal';label='Два режима latency';level='warn';confidence='medium';reason=`Распределение разделилось на ${modes.length} режима; Avg ${fmtCall(avg)}, P99 ${fmtCall(p99)}.`}
+ else if(key!=='burst'&&p50>0&&p99>=Math.max(50,p50*8)&&c>=0.2){key='tail';label='Тяжёлый хвост';level=p99>=1000?'warn':'info';confidence='medium';reason=`P50 ${fmtCall(p50)} → P99 ${fmtCall(p99)}; редкие calls заметно дороже нормы.`}
+ if(largeOutlier&&key!=='burst'){
+  label=`${label} + крупный outlier`;
+  if(max>=5000)level='hot';else if(level==='info')level='warn';
+  reason+=` Отдельный max ${fmtCall(max)} составляет ≈${(maxShare*100).toFixed(maxShare>=0.1?1:2)}% всего измеренного времени этого target за профиль; основной pattern и outlier показаны раздельно.`;
+ }
+ return{key,label,level,confidence,reason,load,callsPerTick:c,callsSeen:seen,avg,typicalAvg,p50,p95,p99,max,totalUs,largeOutlier,maxShare};
+}
+function devicePriorityScore(d){const p=devicePattern(d),load=p.load,max=p.max,p99=p.p99,c=p.callsPerTick;let score=load;score+=Math.min(200,max/25);score+=Math.min(100,p99/20);if(p.key==='burst')score+=80;if(p.key==='sustained')score+=60;if(p.key==='throughput'&&load>=25)score+=40;if(p.key==='rare-costly')score+=35;if(p.key==='bimodal'||p.key==='tail')score+=30;if(c<=0)score=0;return score}
+function physicalGridShape(label){
+ const devices=physicalForGrid(label).filter(d=>n(d.metric?.usPerTick)>0),total=devices.reduce((a,d)=>a+n(d.metric?.usPerTick),0),ticks=Math.max(1,n(report.profileTicks));
+ let outlierLoad=0,topOutlier=null,outlierTargets=0;
+ for(const d of devices){const p=devicePattern(d);if(!p.largeOutlier)continue;const contribution=Math.min(n(d.metric?.usPerTick),p.max/ticks);outlierLoad+=contribution;outlierTargets++;if(!topOutlier||p.max>topOutlier.p.max)topOutlier={d,p,contribution};}
+ outlierLoad=Math.min(total,outlierLoad);const residual=Math.max(0,total-outlierLoad),outlierShare=total>0?outlierLoad/total:0;
+ return{total,residual,outlierLoad,outlierShare,topOutlier,outlierTargets,active:devices.length};
+}
+function foreignDispatchSignal(g){const core=valueOf(g,'core'),ds=dispatchStats(g),share=ds.foreignLoad/Math.max(1,core);return{significant:ds.foreignLoad>=25&&share>=0.08,load:ds.foreignLoad,count:ds.foreignCount,share,reason:`Foreign Level dispatch ${fmt(ds.foreignLoad)} через ${ds.foreignCount} показанных foreign levels; это вторичный fan-out signal, а не primary cause и не доказательство причины лага.`}}
+function gridPattern(g){
+ const core=valueOf(g,'core'),services=valueOf(g,'services'),remainder=valueOf(g,'overhead'),scheduler=valueOf(g,'scheduler'),devices=valueOf(g,'devices'),phys=physicalConcentration(g,5),safeCore=Math.max(1,core),foreignSignal=foreignDispatchSignal(g);
+ let key='mixed',label='Смешанная Grid',level=core>=1000?'warn':'info',confidence='medium',reason=`Core ${fmt(core)}; services ${fmt(services)}, scheduler ${fmt(scheduler)}, devices ${fmt(devices)}.`;
+ if(scheduler>=25&&scheduler>=devices*1.5&&scheduler/safeCore>=0.12){key='scheduler';label='Scheduler-heavy';level=scheduler>=250?'warn':'info';confidence='high';reason=`Scheduler remainder ${fmt(scheduler)} (${pctText(scheduler,core)} Grid Core), ${calls(g?.tickManager?.queue?.callsPerTick)} queue calls.`}
+ else if(devices>=25&&devices>=scheduler*1.25&&devices/safeCore>=0.12){key='devices';label='Device-heavy';level=devices>=250?'warn':'info';confidence='high';reason=`Grid devices ${fmt(devices)} (${pctText(devices,core)} Grid Core). Exact physical targets отдельно: ${fmt(phys.physicalTotal)}.`}
+ else if(remainder/safeCore>=0.60&&remainder>=50){key='remainder';label='Lifecycle/remainder-heavy';level=remainder>=500?'warn':'info';confidence='low';reason=`Grid remainder ${fmt(remainder)} (${pctText(remainder,core)} Core). Это не чистый self-time: здесь реальная Grid работа + instrumentation.`}
+ else if(services/safeCore>=0.65&&services>=50){key='services';label='Service-heavy';level=services>=500?'warn':'info';confidence='medium';reason=`Grid Services ${fmt(services)} (${pctText(services,core)} Core); нужен разбор конкретного service/TickManager ниже.`}
+ if(foreignSignal.significant)reason+=` Secondary signal: ${foreignSignal.reason}`;
+ return{key,label,level,confidence,reason,core,services,remainder,scheduler,devices,foreign:foreignSignal.load,foreignSignal:foreignSignal.significant,physical:phys.physicalTotal};
+}
+function gridPriorityScore(g){const p=gridPattern(g);let score=p.core;if(p.key==='scheduler')score+=p.scheduler*0.7;if(p.key==='devices')score+=p.devices*0.7;if(p.key==='remainder')score+=Math.min(200,p.remainder*0.2);if(p.foreignSignal)score+=Math.min(100,p.foreign*0.25);return score}
+function patternPill(p){return `<span class="pattern-pill ${esc(p?.level||'info')}" title="${esc((p?.reason||'')+' Confidence: '+(p?.confidence||'medium'))}">${esc(p?.label||'mixed')}</span>`}
+function diagnosticPriorityItems(){
+ const out=[],seen=new Set(),push=x=>{if(!x||seen.has(x.key))return;seen.add(x.key);out.push(x)};
+ const sustained=[...allDevices].filter(d=>{const p=devicePattern(d);return (p.key==='sustained'||p.key==='throughput')&&p.load>=10}).sort((a,b)=>devicePriorityScore(b)-devicePriorityScore(a))[0];
+ if(sustained){const p=devicePattern(sustained);push({key:'device:'+deviceKey(sustained),rank:'SUSTAINED',level:p.level,title:humanType(sustained.type),value:fmt(p.load),reason:p.reason,dimension:sustained.dimension,pos:sustained.position,grid:gridByLabel(sustained.gridLabel)?sustained.gridLabel:null})}
+ const burst=[...allDevices].filter(d=>devicePattern(d).key==='burst').sort((a,b)=>devicePattern(b).max-devicePattern(a).max)[0];
+ if(burst){const p=devicePattern(burst);push({key:'device:'+deviceKey(burst),rank:'SPIKE',level:p.level,title:humanType(burst.type),value:`max ${fmtCall(p.max)}`,reason:p.reason,dimension:burst.dimension,pos:burst.position,grid:gridByLabel(burst.gridLabel)?burst.gridLabel:null})}
+ const physicalGrid=physicalByGridStats().filter(x=>x.gridLabel!=='(unlinked)'&&x.total>=10)[0];
+ if(physicalGrid){const share=globalPhysicalTotal()>0?physicalGrid.total/globalPhysicalTotal()*100:0,detail=physicalGrid.detailAvailable?'runtime Top-N detail доступен':'runtime Top-N detail не экспортирован',compact=n(reportLimits.omittedPhysicalDevices)>0?' Сумма — conservative lower bound: compact report мог omitted мелкие targets этой же Grid.':'';push({key:'physical-grid:'+physicalGrid.gridLabel,rank:'PHYSICAL',level:physicalGrid.total>=1000?'hot':physicalGrid.total>=250?'warn':'info',title:`${physicalGrid.gridLabel} physical aggregate`,value:`≥ ${fmt(physicalGrid.total)}`,reason:`${physicalGrid.active}/${physicalGrid.count} активных/экспортированных targets дают ≥${share.toFixed(1)}% exact global physical; ${detail}.${compact}`,dimension:physicalGrid.top?.dimension,pos:physicalGrid.top?.position,grid:physicalGrid.detailAvailable?physicalGrid.gridLabel:null})}
+ const gridTop=[...allGrids].sort((a,b)=>gridPriorityScore(b)-gridPriorityScore(a))[0];
+ if(gridTop){const p=gridPattern(gridTop);push({key:'grid:'+gridTop.label,rank:'GRID',level:p.level,title:gridTop.label,value:fmt(p.core),reason:`${p.label}: ${p.reason}`,dimension:gridTop.dimension,pos:gridTop.anchor,grid:gridTop.label})}
+ const scheduler=[...allGrids].filter(g=>gridPattern(g).key==='scheduler').sort((a,b)=>valueOf(b,'scheduler')-valueOf(a,'scheduler'))[0];
+ if(scheduler){const p=gridPattern(scheduler);push({key:'grid:'+scheduler.label,rank:'SCHED',level:p.level,title:scheduler.label,value:fmt(p.scheduler),reason:p.reason,dimension:scheduler.dimension,pos:scheduler.anchor,grid:scheduler.label})}
+ const foreign=[...allGrids].filter(g=>foreignDispatchSignal(g).significant).sort((a,b)=>foreignDispatch(b)-foreignDispatch(a))[0];
+ if(foreign){const f=foreignDispatchSignal(foreign),p=gridPattern(foreign);push({key:'dispatch:'+foreign.label,rank:'DISPATCH',level:f.load>=100?'warn':'info',title:foreign.label,value:fmt(f.load),reason:`Secondary fan-out signal; primary classification: ${p.label}. ${f.reason}`,dimension:foreign.dimension,pos:foreign.anchor,grid:foreign.label})}
+ return out.slice(0,6);
+}
+function diagnosticPrioritiesHtml(){const items=diagnosticPriorityItems();if(!items.length)return '<div class="plain-good">Явных приоритетов по текущим эвристикам нет.</div>';return items.map((x,i)=>`<div class="priority-item"><div class="priority-rank">#${i+1} · ${esc(x.rank)}</div><div><b>${esc(x.title)}</b><div class="muted">${esc(dimShort(x.dimension))}${x.pos?' · '+esc(posText(x.pos)):''}</div></div><div>${patternPill({label:x.value,level:x.level,reason:x.reason,confidence:'report-derived'})}</div><div class="priority-reason">${esc(x.reason)}</div><div class="simple-actions">${coordActions(x.dimension,x.pos)}${x.grid?`<button data-open-grid="${esc(x.grid)}">Grid</button>`:''}</div></div>`).join('')}
+function renderDiagnosticPriorities(){const html=diagnosticPrioritiesHtml();const a=document.getElementById('simplePriorities'),b=document.getElementById('diagnosticPriorities');if(a)a.innerHTML=html;if(b)b.innerHTML=html}
+function currentDiagnosisItems(){const items=[];const sm=report.sampling||{};if(sm.largeServerMode){const budget=n(sm.skippedByBudget);items.push({level:budget>0?'warn':'info',title:'Large Server sampling',value:`~1/${n(sm.effectiveSampleFactor).toFixed(1)} Level callbacks · max ${n(sm.maxSampleFactor)}x`,text:`Observed ${n(sm.levelLifecycleCallbacksSeenPerProfileTick).toFixed(0)} Level lifecycle callbacks/profile tick; detailed sampled ${n(sm.levelLifecycleCallbacksSampledPerProfileTick).toFixed(0)}/tick. Physical device timing remains exact.${budget>0?` Safety budget skipped ${budget.toLocaleString()} callbacks; Grid/service estimates are conservative.`:''}`})}const dc=report.driveCoverage||{};if(Object.keys(dc).length){const r=dc.resolver||{},o=dc.operations||{},miss=n(o.unresolvedBegins),uw=n(r.unresolvedWatchers),active=n(dc.activeDriveTargets),total=n(dc.physicalDriveTargets);items.push({level:(miss>0||uw>0)?'warn':'info',title:'ME Drive coverage',value:`${active}/${total} active · ${miss.toLocaleString()} unresolved ops`,text:`Watcher cache: ${n(r.resolvedWatchers)} resolved / ${uw} unresolved; recorded-owner ${n(r.resolvedByRecordedOwner)} (stale-snapshot ${n(r.resolvedByRecordedSnapshot)}, entries ${n(r.recordedOwnerEntries)} (pre-session ${n(r.recordedOwnerEntriesAtSessionStart)}), ctor-captures during profile ${n(r.constructorOwnerCaptures)}, slot-updates ${n(r.recordedOwnerUpdates)}, failures ${n(r.recordedOwnerAccessFailures)}), storage-mount ${n(r.resolvedByStorageMountOwner)} (entries ${n(r.storageMountOwnerEntries)}, pre-session ${n(r.storageMountOwnerEntriesAtSessionStart)}, provider ids ${n(r.mountProviderIdentityEntries)}, provider passes ${n(r.storageProviderMountPasses)}, watchers ${n(r.storageMountWatchersSeen)}, failures ${n(r.storageMountAccessFailures)}), pre-map ${n(r.resolvedByHostMapping)}, stable-cell ${n(r.resolvedByCellDelegateIdentity)+n(r.resolvedByCellStackIdentity)+n(r.resolvedByCellUuid)} (delegate ${n(r.resolvedByCellDelegateIdentity)}, stack ${n(r.resolvedByCellStackIdentity)}, uuid ${n(r.resolvedByCellUuid)}; index ${n(r.cellDelegateOwnerEntries)}/${n(r.cellStackOwnerEntries)}/${n(r.cellUuidOwnerEntries)}), legacy save-provider ${n(r.resolvedByCellSaveProvider)}, direct ${n(r.resolvedByDirectOwner)}, callback-capture ${n(r.resolvedByCallbackCapture)}. Stable-cell attempts ${n(r.stableCellResolutionAttempts)}; typed fallback attempts ${n(r.typedCellResolutionAttempts)}; Basic delegates ${n(r.cellDelegateTypeBasic)}, other delegates ${n(r.cellDelegateTypeOther)}, null ${n(r.cellDelegateNull)}, delegate-access failures ${n(r.cellDelegateAccessFailures)}, save-provider failures ${n(r.cellSaveProviderAccessFailures)}, capture misses ${n(r.cellSaveProviderCaptureMisses)}. Begin calls: extract ${n(o.beginExtract).toLocaleString()}, insert ${n(o.beginInsert).toLocaleString()}, preferred ${n(o.beginPreferred).toLocaleString()}, availableStacks ${n(o.beginAvailableStacks).toLocaleString()}. Safe-skip reasons: no-accessor ${n(r.unresolvedReasons?.noOwnerAccessors)}, no-captured-drive ${n(r.unresolvedReasons?.noCapturedDrive)}, safety-reject ${n(r.unresolvedReasons?.safetyReject)}, access-failure ${n(r.unresolvedReasons?.accessFailure)}, direct-not-drive ${n(r.unresolvedReasons?.directOwnerNotDrive)}.`})}const rare=allDevices.filter(d=>n(d.metric?.callsPerTick)>0&&n(d.metric?.callsPerTick)<0.1&&avgCallUs(d.metric)>=500&&n(d.metric?.usPerTick)>=0.25).sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick));if(rare.length){const d=rare[0],extra=rare.length>1?` Ещё таких targets: ${rare.length-1}.`:'';items.push({level:avgCallUs(d.metric)>=2000?'hot':'warn',title:'Редкий дорогой вызов',value:`${fmtCall(avgCallUs(d.metric))} · ${fmt(d.metric?.usPerTick)}`,text:`${humanType(d.type)} · ${dimShort(d.dimension)} @ ${posText(d.position)} · ${calls(d.metric?.callsPerTick)}.${extra}`})}const spiky=allDevices.filter(d=>spikeVal(d,'maxUs')>0&&spikeVal(d,'p95Us')>0).map(d=>({d,ratio:spikeVal(d,'maxUs')/Math.max(1,spikeVal(d,'p50Us'))})).sort((a,b)=>spikeVal(b.d,'maxUs')-spikeVal(a.d,'maxUs'));if(spiky.length){const {d,ratio}=spiky[0],sp=spikeOf(d),shape=spikeShape(sp,avgCallUs(d.metric));items.push({level:sp.maxUs>=5000?'warn':'info',title:'Spike distribution',value:`P99 ${fmtCall(sp.p99Us)} · max ${fmtCall(sp.maxUs)}`,text:`${humanType(d.type)} @ ${posText(d.position)} · Avg ${fmtCall(avgCallUs(d.metric))} · max/P50 ×${ratio.toFixed(1)} · worst tick t+${n(sp.maxTick)}. ${spikeSampleNote(d)}.${shape?' '+shape:''}`})}const concs=allGrids.map(g=>({g,c:physicalConcentration(g)})).filter(x=>x.c.activeCount>=5&&x.c.physicalTotal>=1&&x.c.physicalShare>=70).sort((a,b)=>b.c.topTotal-a.c.topTotal);if(concs.length){const {g,c}=concs[0],deviceShare=c.devicesShare>0&&c.devicesShare<=125?` Это ≈${c.devicesShare.toFixed(1)}% Grid devices bucket.`:'';items.push({level:c.physicalShare>=90?'hot':'warn',title:'Нагрузка сконцентрирована',value:`Top ${c.topCount} = ${c.physicalShare.toFixed(1)}% physical`,text:`${g.label} · ${dimShort(g.dimension)}. ${fmt(c.topTotal)} из ${fmt(c.physicalTotal)} physical targets.${deviceShare}`})}const dispatch=allGrids.map(g=>({g,s:dispatchStats(g)})).filter(x=>x.s.foreignCount>=5&&x.s.foreignLoad>=1).sort((a,b)=>b.s.foreignLoad-a.s.foreignLoad);if(dispatch.length){const {g,s}=dispatch[0];items.push({level:s.foreignLoad>=25?'warn':'info',title:'Foreign Level dispatch',value:`${s.foreignCount} foreign levels · ${fmt(s.foreignLoad)}`,text:`${g.label}: anchor ${s.anchorCount} level / ${fmt(s.anchorLoad)}. Это диагностический fan-out, а не автоматическое доказательство бага AE2.`})}const risks=allGrids.map(g=>({g,r:observerRisk(g)})).filter(x=>x.r.level!=='low').sort((a,b)=>b.r.remainder-a.r.remainder);if(risks.length){const {g,r}=risks[0];items.push({level:'info',title:'Observer-risk для Grid remainder',value:`${observerRiskText(r)} · ${fmt(r.remainder)}`,text:`${g.label}: ${calls(r.callsPerTick)} Grid lifecycle calls. Remainder = Grid Core − Services и может содержать реальную AE2-работу плюс instrumentation; это риск-оценка, не измерение self-time.`})}if(!items.length)items.push({level:'info',title:'Явных current-only hotspots нет',value:'Нормальный профиль',text:'Пороговые эвристики не нашли редких дорогих вызовов, сильной концентрации physical load или заметного foreign dispatch.'});return items}
 function diagnosisHtml(items){return items.map(x=>`<div class="diag-card ${x.level||'info'}"><h3>${esc(x.title)}</h3><div class="diag-value">${esc(x.value)}</div><div class="diag-text">${esc(x.text)}</div></div>`).join('')}
 function renderCurrentDiagnosis(){const html=diagnosisHtml(currentDiagnosisItems());const s=document.getElementById('simpleDiagnosis'),e=document.getElementById('currentDiagnosis');if(s)s.innerHTML=html;if(e)e.innerHTML=html}
 
-function physicalByGridStats(){const map=new Map();for(const d of allDevices){const k=d.gridLabel||'(unlinked)';let x=map.get(k);if(!x){x={gridLabel:k,count:0,total:0,max:0,top:null};map.set(k,x)}const v=n(d.metric?.usPerTick);x.count++;x.total+=v;if(v>x.max){x.max=v;x.top=d}}return [...map.values()].sort((a,b)=>b.total-a.total)}
+
+function adminPriorityLevel(score,confidence='medium'){
+ if(confidence==='low'&&score<900)return {key:'watch',label:'Нужно проверить',level:'info',rank:2};
+ if(score>=500)return {key:'high',label:'Высокий приоритет',level:'hot',rank:4};
+ if(score>=200)return {key:'medium',label:'Средний приоритет',level:'warn',rank:3};
+ if(score>=75)return {key:'watch',label:'Нужно проверить',level:'info',rank:2};
+ return {key:'low',label:'Низкий приоритет',level:'info',rank:1};
+}
+function adminConfidenceText(v){return v==='high'?'высокая':v==='low'?'низкая':'средняя'}
+function adminGridFinding(g){
+ const core=valueOf(g,'core'),services=valueOf(g,'services'),scheduler=valueOf(g,'scheduler'),devices=valueOf(g,'devices'),remainder=valueOf(g,'overhead'),tm=g?.tickManager||{},tmService=n(tm.service?.usPerTick),queue=n(tm.queue?.usPerTick),queueCalls=n(tm.queue?.callsPerTick),deviceCalls=n(g?.metrics?.devices?.callsPerTick),foreign=foreignDispatchSignal(g),risk=observerRisk(g),phys=physicalByGridStats().find(x=>x.gridLabel===g.label)||null,shape=physicalGridShape(g.label);
+ const combined=scheduler+devices,ratio=devices>0?scheduler/devices:(scheduler>0?99:1),safeCore=Math.max(1,core),remainderShare=remainder/safeCore,remainderMajority=remainder>=150&&remainderShare>=0.65,remainderDominant=remainder>=150&&remainderShare>=0.55&&remainder>=combined*1.5,hierarchyInconsistent=devices>=50&&((tmService>=25&&devices>tmService*1.10)||(queue>=25&&devices>queue*1.10)),remainderGuard=remainderMajority||remainderDominant,consistencyGuard=remainderGuard||hierarchyInconsistent,spikeDominated=shape.total>=50&&shape.outlierLoad>=100&&shape.outlierShare>=0.50&&devices>=50&&shape.outlierLoad>=devices*0.40;
+ let cause='Смешанная работа AE2',character='Смешанная нагрузка',confidence='medium',note='Несколько measured buckets заметны одновременно; технические детали доступны в Expert mode.';
+ if(remainderGuard){cause='Grid lifecycle / remainder';character='Причина отделена не полностью';confidence='low';note=remainderMajority?`Remainder занимает ${(remainderShare*100).toFixed(1)}% Grid Core, поэтому конкретный TickManager/device bucket не объявляется причиной даже если он выглядит большим.`:'Remainder заметно больше scheduler+devices вместе. Он содержит реальную Grid работу и instrumentation, поэтому конкретный TickManager bucket здесь не объявляется готовой причиной.';if(hierarchyInconsistent)note+=` Дополнительно inclusive hierarchy несогласована: devices ${fmt(devices)} больше measured TickManager service ${fmt(tmService)}${queue>0?` / queue ${fmt(queue)}`:''}; это снижает уверенность атрибуции.`}
+ else if(hierarchyInconsistent){cause='Inclusive timing / несогласованные buckets';character='Причина отделена не полностью';confidence='low';note=`Device bucket ${fmt(devices)} больше measured TickManager service ${fmt(tmService)}${queue>0?` / queue ${fmt(queue)}`:''}. При такой inclusive/sampled иерархии нельзя надёжно объявлять устройства primary cause; используйте Expert detail как доказательство формы нагрузки, а не готовый вердикт.`}
+ else if(spikeDominated){cause='Редкий physical spike + фон устройств';character='Spike сильно влияет на среднее';confidence='medium';note=`Крупные physical outlier-события дают ≈${(shape.outlierShare*100).toFixed(1)}% экспортированной physical-суммы этой Grid. После их удаления остаётся ${n(reportLimits.omittedPhysicalDevices)>0?'≥ ':''}${fmt(shape.residual)} exported physical background; поэтому полную device-среднюю нельзя называть постоянной нагрузкой.`}
+ else if(scheduler>=75&&devices>=75&&combined>=150){const balance=ratio>=0.67&&ratio<=1.5?'scheduler + устройства':ratio>1.5?'scheduler с вкладом устройств':'устройства с вкладом scheduler';cause=`TickManager: ${balance}`;character=(queueCalls>=0.5||deviceCalls>=0.5)?'Повторяющаяся нагрузка':'Нагрузка внутри TickManager';confidence='high';note='Scheduler и device work одновременно дают значимый измеренный вклад; это полезнее общего ярлыка Service-heavy/Mixed.'}
+ else if(scheduler>=50&&scheduler>=devices*1.5){cause='TickManager / scheduler';character=queueCalls>=0.5?'Повторяющаяся scheduler-нагрузка':'Scheduler-нагрузка';confidence='high';note='Основной измеренный вклад внутри TickManager приходится на scheduler remainder.'}
+ else if(devices>=50&&devices>=scheduler*1.25){cause='Устройства внутри TickManager';character=deviceCalls>=0.5?'Повторяющаяся device-нагрузка':'Device-нагрузка';confidence='high';note='Основной измеренный вклад внутри TickManager приходится на device execution.'}
+ else if(services>=100&&services/safeCore>=0.55){cause='Сервисы AE2 / TickManager';character='Повторяющаяся service-нагрузка';confidence='medium';note='Services занимают большую долю Grid Core; в Expert mode можно увидеть конкретный service и queue.'}
+ else if(remainder>=150&&remainder/safeCore>=0.55){cause='Grid lifecycle / remainder';character='Причина отделена не полностью';confidence='low';note='Большая часть времени остаётся вне известных service buckets. Remainder может содержать реальную AE2-работу и instrumentation, поэтому это сигнал для проверки, а не готовый диагноз.'}
+ const physical=phys?n(phys.total):0,adjustment=spikeDominated&&!consistencyGuard?Math.min(shape.outlierLoad,devices,queue,core):0,sustainedCore=Math.max(0,core-adjustment),sustainedDevices=Math.max(0,devices-adjustment),sustainedQueue=Math.max(0,queue-adjustment),sustainedCombined=scheduler+sustainedDevices,score=Math.max(sustainedCore*0.75,sustainedCombined,(shape.total>0?shape.residual:physical)*1.2,sustainedQueue*0.9);let priority=adminPriorityLevel(score,confidence);if(consistencyGuard&&core>=900&&priority.key==='watch'){priority={key:'medium',label:'Средний приоритет',level:'warn',rank:3};note+=' Измеренный Grid Core остаётся высоким, поэтому сеть не скрывается из Top-5: приоритет отражает масштаб, а низкая уверенность — только качество causal attribution.'}
+ let evidence=[`Grid Core ${fmt(core)}`];
+ if(remainderGuard){evidence.push(`remainder ${fmt(remainder)}`);if(tmService>=25)evidence.push(`TickManager service ${fmt(tmService)}`);if(devices>=25)evidence.push(`devices ${fmt(devices)}`)}
+ else if(hierarchyInconsistent){evidence.push(`devices ${fmt(devices)}`);if(tmService>=25)evidence.push(`TickManager service ${fmt(tmService)}`);if(queue>=25)evidence.push(`queue ${fmt(queue)}`)}
+ else if(spikeDominated){evidence.push(`devices ${fmt(devices)}`,`outlier ≈ ${fmt(shape.outlierLoad)}`,`${n(reportLimits.omittedPhysicalDevices)>0?'≥ ':''}physical без крупных outliers ${fmt(shape.residual)}`)}
+ else {if(scheduler>=25)evidence.push(`scheduler ${fmt(scheduler)}`);if(devices>=25)evidence.push(`devices ${fmt(devices)}`);if(queue>=25)evidence.push(`queue ${fmt(queue)}`);if(physical>=10)evidence.push(`${n(reportLimits.omittedPhysicalDevices)>0?'≥ ':''}physical ${fmt(physical)}`)}
+ if(!spikeDominated&&shape.topOutlier&&shape.outlierLoad>=25){note+=` Отдельно найден крупный physical outlier ${fmtCall(shape.topOutlier.p.max)}; после исключения известных крупных outliers exported physical остаётся ${n(reportLimits.omittedPhysicalDevices)>0?'≥ ':''}${fmt(shape.residual)}, поэтому основной sustained finding не строится только на этом spike.`}
+ if(foreign.significant)note+=` Есть secondary foreign fan-out ${fmt(foreign.load)}, но он не выбран primary cause.`;
+ return{key:`grid:${g.label}`,kind:'grid',grid:g.label,dimension:g.dimension,pos:g.anchor,priority,cause,character,confidence,note,evidence:evidence.slice(0,4),score,core,physical,risk:risk.level,detailAvailable:true,spikeDominated,remainderDominant,remainderMajority,hierarchyInconsistent,consistencyGuard};
+}
+function adminPhysicalOnlyFinding(x){const d=x.top,shape=physicalGridShape(x.gridLabel),compact=n(reportLimits.omittedPhysicalDevices)>0,share=globalPhysicalTotal()>0?x.total/globalPhysicalTotal()*100:0,score=shape.residual*1.2,priority=adminPriorityLevel(score,'medium');let cause='Физические устройства этой Grid',character='Постоянная physical нагрузка',note=`Grid не вошла в runtime Top-N detail, поэтому причина внутри Grid не классифицируется. ${compact?'Показанная сумма — нижняя граница из-за compact omissions.':'Все physical targets представлены.'}`;if(shape.topOutlier){if(shape.outlierShare>=0.50){cause='Physical load со spike-доминированием';character='Редкий spike сильно влияет на среднее';note+=` Известные крупные outliers дают ≈${(shape.outlierShare*100).toFixed(1)}% exported physical; без них остаётся ${compact?'≥ ':''}${fmt(shape.residual)}.`}else{character='Постоянная physical нагрузка + крупный outlier';note+=` Отдельный max ${fmtCall(shape.topOutlier.p.max)} виден отдельно, но после исключения известных крупных outliers остаётся ${compact?'≥ ':''}${fmt(shape.residual)} exported physical, поэтому sustained finding сохраняется.`}}const evidence=[`${compact?'≥ ':''}physical ${fmt(x.total)}`,`${compact?'≥ ':''}${share.toFixed(1)}% exact physical`,shape.topOutlier?`${compact?'≥ ':''}без крупных outliers ${fmt(shape.residual)}`:`${x.active}/${x.count} активных/экспортированных targets`,shape.topOutlier?`top outlier ${fmtCall(shape.topOutlier.p.max)}`:d?`top: ${humanType(d.type)} ${fmt(x.max)}`:''].filter(Boolean);return{key:`physical:${x.gridLabel}`,kind:'physical',grid:x.gridLabel,dimension:d?.dimension,pos:d?.position,priority,cause,character,confidence:'medium',note,evidence,score,core:0,physical:x.total,risk:'unknown',detailAvailable:false};}
+function adminFindings(){const out=allGrids.map(adminGridFinding).filter(x=>x.priority.key!=='low');const existing=new Set(out.map(x=>x.grid));for(const x of physicalByGridStats()){if(x.gridLabel==='(unlinked)'||x.detailAvailable||existing.has(x.gridLabel)||x.total<50)continue;const f=adminPhysicalOnlyFinding(x);if(f.priority.key!=='low')out.push(f)}out.sort((a,b)=>b.priority.rank-a.priority.rank||b.score-a.score||b.physical-a.physical);return out.slice(0,5)}
+function adminRareEvents(){return [...allDevices].map(d=>({d,p:devicePattern(d),max:spikeVal(d,'maxUs'),seen:n(spikeOf(d)?.callsSeen),c:n(d.metric?.callsPerTick)})).filter(x=>x.max>=300&&(x.p.key==='burst'||x.p.largeOutlier||x.seen<=3||x.c<0.1)).sort((a,b)=>b.max-a.max).slice(0,3)}
+function adminFindingHtml(x,i){const location=x.pos?`${dimShort(x.dimension)} · ${posText(x.pos)}`:dimShort(x.dimension),where=x.kind==='physical'?'координаты самого заметного exported target':'anchor Grid';return `<div class="admin-finding ${x.priority.level}"><div class="admin-finding-head"><div><span class="admin-priority ${x.priority.level}">#${i+1} · ${esc(x.priority.label)}</span><h3>${esc(x.grid)}</h3><div class="admin-meta"><span>${esc(location)}</span><span>${esc(where)}</span><span>уверенность: <b>${esc(adminConfidenceText(x.confidence))}</b></span></div></div><div>${patternPill({label:x.character,level:x.priority.level,reason:x.note,confidence:x.confidence})}</div></div><div class="admin-cause">Причина: ${esc(x.cause)}</div><div class="admin-character">${esc(x.note)}</div><div class="admin-evidence">${x.evidence.map(e=>`<span>${esc(e)}</span>`).join('')}</div><div class="simple-actions">${coordActions(x.dimension,x.pos)}${x.detailAvailable?`<button data-open-grid="${esc(x.grid)}">Технические подробности</button>`:''}</div></div>`}
+function adminSpikeHtml(x){const d=x.d,p=x.p,rare=x.seen<=3||x.c<0.1,activeOutlier=p.largeOutlier&&!rare;const msg=activeOutlier?'На фоне частых вызовов обнаружен отдельный крупный outlier. Постоянный поток и этот spike показаны раздельно; не считать всю среднюю нагрузку единичным событием.':rare?'Редкое событие: не считать постоянным источником нагрузки без повторяемости.':'Есть дорогой хвост вызовов, но он не является главным sustained finding.';return `<div class="admin-spike"><h3>${esc(humanType(d.type))}</h3><div class="diag-value">max ${fmtCall(x.max)}</div><div class="admin-meta"><span>${esc(dimShort(d.dimension))} · ${esc(posText(d.position))}</span><span>${x.seen.toLocaleString()} calls за профиль</span></div><div class="admin-note">${msg} Средняя нагрузка ${fmt(d.metric?.usPerTick)}.</div><div class="simple-actions">${coordActions(d.dimension,d.position)}${d.gridLabel&&gridByLabel(d.gridLabel)?`<button data-open-grid="${esc(d.gridLabel)}">Технические подробности</button>`:''}</div></div>`}
+function adminSummaryText(){const findings=adminFindings(),rare=adminRareEvents(),high=findings.filter(x=>x.priority.key==='high').length,medium=findings.filter(x=>x.priority.key==='medium').length,top=findings[0],o=report.driveCoverage?.operations||{};const lines=[`Observable AE2 Admin Report v20.5.3`,`Профиль: ${n(report.profileTicks)} ticks / ${n(report.profileWallClockMs)} ms, observed ${n(report.observedProfileTps).toFixed(2)} TPS`,`Приоритеты: высоких ${high}, средних ${medium}, всего показано ${findings.length}; редких событий ${rare.length}`,`Drive coverage: ${n(o.resolvedBegins)}/${n(o.begins)} resolved, unresolved ${n(o.unresolvedBegins)}`];if(top)lines.push(`Главное: ${top.grid} — ${top.cause}; ${top.character}; ${top.evidence.join(', ')}`);for(const [i,x] of findings.entries())lines.push(`${i+1}. ${x.priority.label}: ${x.grid} — ${x.cause}; ${x.character}; ${x.evidence.join(', ')}`);if(rare.length)lines.push(`Редкие события: ${rare.map(x=>`${humanType(x.d.type)} ${dimShort(x.d.dimension)} @ ${posText(x.d.position)} max ${fmtCall(x.max)}`).join('; ')}`);return lines.join('\\n')}
+function renderAdminReport(){const findings=adminFindings(),rare=adminRareEvents(),high=findings.filter(x=>x.priority.key==='high').length,medium=findings.filter(x=>x.priority.key==='medium').length,watch=findings.filter(x=>x.priority.key==='watch').length,o=report.driveCoverage?.operations||{},coverage=n(o.begins)>0&&n(o.unresolvedBegins)===0,top=findings[0],scout=globalTotals.gridTotalsScope==='scout-estimate';document.getElementById('simpleHero').innerHTML=top?`<h2>Итог для администрации</h2><div class="big ${top.priority.level==='hot'?'plain-hot':top.priority.level==='warn'?'plain-warn':'plain-good'}">${esc(top.priority.label)} · ${esc(top.grid)}</div><div class="lead"><b>${esc(top.cause)}.</b> ${esc(top.character)}. Сначала разберите эту сеть; остальные приоритеты ниже. ${scout?'Global Grid цифра сверху в Expert mode — scout estimate, не полный MSPT сервера.':''}</div>`:`<h2>Итог для администрации</h2><div class="big plain-good">Явных AE2-приоритетов не найдено</div><div class="lead">Текущие report-derived пороги не нашли заметной sustained Grid/physical нагрузки. Редкие события показаны отдельно и не считаются постоянной причиной.</div>`;document.getElementById('simpleCards').innerHTML=`<div class="card"><small>Высокий приоритет</small><b class="${high?'plain-hot':'plain-good'}">${high}</b></div><div class="card"><small>Средний приоритет</small><b class="${medium?'plain-warn':'plain-good'}">${medium}</b></div><div class="card"><small>Нужно проверить</small><b>${watch}</b></div><div class="card"><small>Drive coverage</small><b class="${coverage?'plain-good':'plain-hot'}">${coverage?'OK':'WARN'}</b><small>${n(o.resolvedBegins).toLocaleString()}/${n(o.begins).toLocaleString()} resolved</small></div>`;document.getElementById('adminFindings').innerHTML=findings.length?findings.map(adminFindingHtml).join(''):'<div class="admin-good">По текущим порогам нет сетей, которые надо поднимать в административный Top-5. Экспертные данные сохранены.</div>';document.getElementById('adminSpikes').innerHTML=rare.length?rare.map(adminSpikeHtml).join(''):'<div class="admin-good">Редких физических событий ≥300 µs, подходящих под административный фильтр, в этом профиле нет.</div>';}
+
+function renderOverview(){const s=globalStats();const physicalTotal=globalPhysicalTotal();renderCurrentDiagnosis();renderDiagnosticPriorities();renderSpikeAnalysis();document.getElementById('globalCards').innerHTML=`<div class="card"><small>Σ Grid Core</small><b>${fmt(s.core)}</b></div><div class="card"><small>Σ Grid Devices</small><b>${fmt(s.devices)}</b></div><div class="card"><small>Σ Physical targets</small><b>${fmt(physicalTotal)}</b></div><div class="card"><small>AE2 Grids</small><b>${s.grids.toLocaleString()}</b></div><div class="card"><small>Linked physical</small><b>${s.linked}/${observedPhysicalCount()}</b></div>`;
+ const top=[...allGrids].sort((a,b)=>valueOf(b,'core')-valueOf(a,'core')).slice(0,20);const tg=document.getElementById('topGrids');tg.innerHTML=gridRows(top);bindGridRows(tg,top);
+ const dims=dimensionStats().slice(0,15);document.getElementById('dimensionSummary').innerHTML=`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Dimension</th><th>Grids</th><th>Σ Core</th><th>Share</th><th>Max Core</th><th>Σ Devices</th></tr></thead><tbody>${dims.map(x=>`<tr class="clickable"><td class="left dim" title="${esc(x.dimension)}">${esc(dimShort(x.dimension))}</td><td>${x.count}</td><td>${fmt(x.core)}</td><td>${pctText(x.core,s.core)}</td><td>${fmt(x.max)}</td><td>${fmt(x.devices)}</td></tr>`).join('')}</tbody></table></div>`;document.querySelectorAll('#dimensionSummary tbody tr').forEach((tr,i)=>tr.onclick=()=>{document.getElementById('gridDimension').value=dims[i].dimension;switchView('grids')});
+ const devices=[...allDevices].sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick));document.getElementById('topDevices').innerHTML=devices.length?deviceRows(devices,20):'<div class="empty">В этом отчёте нет physicalDevices.</div>';
+ const pg=physicalByGridStats().slice(0,20),compactPhysical=n(reportLimits.omittedPhysicalDevices)>0;document.getElementById('physicalByGrid').innerHTML=pg.length?`<div class="mode-hint">Per-Grid sum uses exported physical targets; ${compactPhysical?'with compact omissions it is a conservative lower bound (≥ share of exact global physical).':'all physical targets are represented in the report.'}</div><div class="table-scroll compact"><table class="data-table"><thead><tr><th>Grid</th><th>Active/exported</th><th>Σ exported physical</th><th>Exact-global share</th><th>Grid detail</th><th>Max target</th></tr></thead><tbody>${pg.map(x=>`<tr class="${x.detailAvailable?'clickable':''}" ${x.detailAvailable?`data-open-grid="${esc(x.gridLabel)}"`:''}><td class="left">${x.gridLabel==='(unlinked)'?'<span class="muted">unlinked</span>':esc(x.gridLabel)}</td><td>${x.active}/${x.count}</td><td>${compactPhysical&&x.gridLabel!=='(unlinked)'?'≥ ':''}${fmt(x.total)}</td><td>${compactPhysical&&x.gridLabel!=='(unlinked)'?'≥ ':''}${pctText(x.total,physicalTotal)}</td><td>${x.gridLabel==='(unlinked)'?'—':x.detailAvailable?'<span class="plain-good">Top-N detail</span>':'<span class="plain-warn">physical-only</span>'}</td><td>${fmt(x.max)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Нет physical devices</div>';
+ const types=deviceTypeStats().slice(0,20);document.getElementById('hotspotTypes').innerHTML=types.length?`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Type</th><th>Positions</th><th>Σ load</th><th>Share</th><th>Avg/call</th></tr></thead><tbody>${types.map(x=>`<tr><td class="left clip" title="${esc(x.type)}">${esc(x.type)}</td><td>${x.count}</td><td>${fmt(x.total)}</td><td>${pctText(x.total,physicalTotal)}</td><td>${fmtCall(x.avgCall)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Нет данных</div>';
+}
+function physicalByGridStats(){const map=new Map();for(const d of allDevices){const k=d.gridLabel||'(unlinked)';let x=map.get(k);if(!x){x={gridLabel:k,count:0,active:0,total:0,max:0,top:null,detailAvailable:false};map.set(k,x)}const v=n(d.metric?.usPerTick);x.count++;if(v>0)x.active++;x.total+=v;if(v>x.max){x.max=v;x.top=d}}for(const x of map.values())x.detailAvailable=x.gridLabel!=='(unlinked)'&&!!gridByLabel(x.gridLabel);return [...map.values()].sort((a,b)=>b.total-a.total)}
 function deviceTypeStats(devices=allDevices){const map=new Map();for(const d of devices){const k=d.type||'unknown';let x=map.get(k);if(!x){x={type:k,count:0,total:0,max:0,nanos:0,calls:0};map.set(k,x)}const v=n(d.metric?.usPerTick);x.count++;x.total+=v;x.max=Math.max(x.max,v);x.nanos+=n(d.metric?.totalNanos);x.calls+=n(d.metric?.calls)}for(const x of map.values())x.avgCall=x.calls>0?x.nanos/1000/x.calls:0;return [...map.values()].sort((a,b)=>b.total-a.total)}
 const pctDelta=(cur,base)=>base>0?(cur-base)/base*100:(cur>0?Infinity:0);
 const signedPct=p=>Number.isFinite(p)?`${p>0?'+':''}${p.toFixed(Math.abs(p)>=100?0:1)}%`:(p>0?'from 0':'—');
@@ -1492,33 +1905,25 @@ function restoreUiState(){try{const s=JSON.parse(localStorage.getItem(UI_STORAGE
 function setSelectValue(id,value,fallback='*'){const el=document.getElementById(id);if([...el.options].some(o=>o.value===String(value)))el.value=String(value);else el.value=fallback}
 function syncStateToControls(){document.getElementById('gridSearch').value=gridState.q||'';setSelectValue('gridDimension',gridState.dimension);document.getElementById('gridMin').value=gridState.min;setSelectValue('gridSort',gridState.sort,'core');setSelectValue('gridTop',gridState.top,'50');document.getElementById('gridActive').checked=!!gridState.active;document.getElementById('deviceSearch').value=deviceState.q||'';setSelectValue('deviceDimension',deviceState.dimension);document.getElementById('deviceMin').value=deviceState.min;setSelectValue('deviceSort',deviceState.sort,'time');setSelectValue('deviceTop',deviceState.top,'50');setSelectValue('compareKind',compareState.kind,'all');setSelectValue('compareSort',compareState.sort,'delta');document.getElementById('comparePct').value=compareState.minPct;document.getElementById('compareAbs').value=compareState.minAbs;setSelectValue('compareTop',compareState.top,'100')}
 function dimensionStats(){const map=new Map();for(const g of allGrids){const d=g.dimension||'unknown';let x=map.get(d);if(!x){x={dimension:d,count:0,core:0,max:0,devices:0,scheduler:0};map.set(d,x)}const c=valueOf(g,'core');x.count++;x.core+=c;x.max=Math.max(x.max,c);x.devices+=valueOf(g,'devices');x.scheduler+=valueOf(g,'scheduler')}return [...map.values()].sort((a,b)=>b.core-a.core)}
-function globalStats(){return{core:allGrids.reduce((a,g)=>a+valueOf(g,'core'),0),devices:allGrids.reduce((a,g)=>a+valueOf(g,'devices'),0),scheduler:allGrids.reduce((a,g)=>a+valueOf(g,'scheduler'),0),grids:allGrids.length,dims:new Set(allGrids.map(g=>g.dimension||'unknown')).size,linked:allDevices.filter(d=>d.gridLabel).length}}
-function gridRows(grids,limit=0){const total=globalStats().core;const rows=(limit?grids.slice(0,limit):grids).map(g=>`<tr class="clickable" data-grid="${esc(g.label+'|'+g.dimension+'|'+anchorText(g))}"><td class="left">${badge(valueOf(g,'core'))} <b>${esc(g.label)}</b></td><td>${fmt(valueOf(g,'core'))}</td><td>${pctText(valueOf(g,'core'),total)}</td><td>${fmt(valueOf(g,'devices'))}</td><td>${fmt(valueOf(g,'scheduler'))}</td><td>${fmt(valueOf(g,'overhead'))}</td><td class="left dim" title="${esc(g.dimension)}">${esc(dimShort(g.dimension))}</td><td>${esc(anchorText(g))}</td><td>${coordActions(g.dimension,g.anchor)}</td></tr>`).join('');return `<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Grid</th><th>Core</th><th>Share</th><th>Devices</th><th>Scheduler</th><th>Remainder*</th><th class="left">Dimension</th><th>Anchor</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`}
+function globalStats(){return{core:globalValue('gridCoreUsPerTick',allGrids.reduce((a,g)=>a+valueOf(g,'core'),0)),devices:globalValue('gridDevicesUsPerTick',allGrids.reduce((a,g)=>a+valueOf(g,'devices'),0)),scheduler:globalValue('schedulerUsPerTick',allGrids.reduce((a,g)=>a+valueOf(g,'scheduler'),0)),grids:globalValue('observedGrids',allGrids.length),dims:globalValue('observedDimensions',new Set(allGrids.map(g=>g.dimension||'unknown')).size),linked:globalValue('linkedPhysicalDevices',allDevices.filter(d=>d.gridLabel).length)}}
+function gridRows(grids,limit=0){const total=globalStats().core;const rows=(limit?grids.slice(0,limit):grids).map(g=>{const gp=gridPattern(g);return `<tr class="clickable" data-grid="${esc(g.label+'|'+g.dimension+'|'+anchorText(g))}"><td class="left">${badge(valueOf(g,'core'))} <b>${esc(g.label)}</b></td><td>${fmt(valueOf(g,'core'))}</td><td>${pctText(valueOf(g,'core'),total)}</td><td class="left">${patternPill(gp)}</td><td>${fmt(valueOf(g,'devices'))}</td><td>${fmt(valueOf(g,'scheduler'))}</td><td>${fmt(valueOf(g,'overhead'))}</td><td class="left dim" title="${esc(g.dimension)}">${esc(dimShort(g.dimension))}</td><td>${esc(anchorText(g))}</td><td>${coordActions(g.dimension,g.anchor)}</td></tr>`}).join('');return `<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Grid</th><th>Core</th><th>Share</th><th class="left">Pattern</th><th>Devices</th><th>Scheduler</th><th>Remainder*</th><th class="left">Dimension</th><th>Anchor</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`}
 function bindGridRows(root,grids){root.querySelectorAll('tbody tr').forEach((tr,i)=>tr.onclick=e=>{if(e.target.closest('[data-copy-text]'))return;selectedGrid=grids[i];switchView('grids')})}
-function deviceRows(devices,limit=0){const arr=limit?devices.slice(0,limit):devices;const total=allDevices.reduce((a,d)=>a+n(d.metric?.usPerTick),0);const rows=arr.map(d=>`<tr><td class="left clip" title="${esc(d.type)}">${badge(d.metric?.usPerTick)} <b>${esc(d.type||'unknown')}</b></td><td>${fmt(d.metric?.usPerTick)}</td><td>${pctText(d.metric?.usPerTick,total)}</td><td>${fmtCall(avgCallUs(d.metric))}</td><td>${fmtCall(spikeVal(d,'p50Us'))}</td><td>${fmtCall(spikeVal(d,'p95Us'))}</td><td>${fmtCall(spikeVal(d,'p99Us'))}</td><td>${fmtCall(spikeVal(d,'maxUs'))}</td><td>${n(spikeOf(d)?.callsSeen).toLocaleString()}</td><td>${calls(d.metric?.callsPerTick)}</td><td>${gridLink(d.gridLabel)}</td><td class="left dim" title="${esc(d.dimension)}">${esc(dimShort(d.dimension))}</td><td>${esc(posText(d.position))}</td><td>${coordActions(d.dimension,d.position)}</td></tr>`).join('');return `<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Physical device</th><th>Load</th><th>Share</th><th>Avg</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th><th>Samples</th><th>Calls</th><th>Grid</th><th class="left">Dimension</th><th>Position</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`}
-function simpleDeviceHtml(d){const load=n(d.metric?.usPerTick);return `<div class="simple-device"><div><b>${esc(humanType(d.type))}</b><div class="where">${esc(dimShort(d.dimension))} · ${esc(posText(d.position))} · ${d.gridLabel?esc(d.gridLabel):'unlinked'}</div></div><div><b>${fmt(load)}</b><div class="muted">${fmtCall(avgCallUs(d.metric))}</div></div><div>${esc(deviceFrequencyText(d))}</div><div class="simple-actions">${coordActions(d.dimension,d.position)}${d.gridLabel?`<button data-open-grid="${esc(d.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}
-function renderSimple(){const s=globalStats(),physicalTotal=allDevices.reduce((a,d)=>a+n(d.metric?.usPerTick),0),topGrid=[...allGrids].sort((a,b)=>valueOf(b,'core')-valueOf(a,'core'))[0]||null;const [grade,gradeClass]=simpleGrade(s.core),budget=tickBudgetPct(s.core);renderCurrentDiagnosis();renderSpikeAnalysis();document.getElementById('simpleHero').innerHTML=`<h2>Что сейчас грузит AE2</h2><div class="big ${gradeClass}">${ms(s.core)} · ${budget.toFixed(budget>=10?1:2)}% от 50 ms/t</div><div class="lead"><b>${grade}.</b> Это сумма измеренного Grid Core по сетям AE2, а не полный MSPT сервера.${topGrid?` Самая тяжёлая сеть сейчас — <b>${esc(topGrid.label)}</b> в <b>${esc(dimShort(topGrid.dimension))}</b>: ${fmt(valueOf(topGrid,'core'))}.`:''}</div>`;document.getElementById('simpleCards').innerHTML=`<div class="card"><small>Всего сетей</small><b>${s.grids}</b></div><div class="card"><small>Dimensions</small><b>${s.dims}</b></div><div class="card"><small>Работа устройств внутри Grid</small><b>${ms(s.devices)}</b></div><div class="card"><small>Физические targets</small><b>${ms(physicalTotal)}</b></div><div class="card"><small>Привязано к Grid</small><b>${s.linked}/${allDevices.length}</b></div>`;
- const grids=[...allGrids].sort((a,b)=>valueOf(b,'core')-valueOf(a,'core')).slice(0,6);document.getElementById('simpleProblems').innerHTML=grids.map((g,i)=>`<div class="simple-issue ${i===0?'hot':''}"><h3>${i===0?'Главная проблема':'Следующая по нагрузке'} · ${esc(g.label)}</h3><div class="simple-load">${fmt(valueOf(g,'core'))}</div><div class="where muted">${esc(dimShort(g.dimension))} · anchor ${esc(anchorText(g))}</div><div class="simple-why">${esc(simpleGridCause(g))}</div><div class="simple-actions">${coordActions(g.dimension,g.anchor)}<button data-open-grid="${esc(g.label)}">Подробнее</button></div></div>`).join('')||'<div class="empty">Нет Grid данных.</div>';
- const dims=dimensionStats().slice(0,8);document.getElementById('simpleDimensions').innerHTML=`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Где</th><th>Сетей</th><th>AE2 нагрузка</th><th>Самая тяжёлая сеть</th></tr></thead><tbody>${dims.map(x=>`<tr><td class="left">${esc(dimShort(x.dimension))}</td><td>${x.count}</td><td>${fmt(x.core)}</td><td>${fmt(x.max)}</td></tr>`).join('')}</tbody></table></div>`;
- const devices=[...allDevices].filter(d=>n(d.metric?.usPerTick)>0).sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick)).slice(0,10);document.getElementById('simpleDevices').innerHTML=devices.map(simpleDeviceHtml).join('')||'<div class="empty">Нет активных физических AE2-устройств.</div>';renderSimpleCompare()}
-function renderOverview(){const s=globalStats();const physicalTotal=allDevices.reduce((a,d)=>a+n(d.metric?.usPerTick),0);renderCurrentDiagnosis();renderSpikeAnalysis();document.getElementById('globalCards').innerHTML=`<div class="card"><small>Σ Grid Core</small><b>${fmt(s.core)}</b></div><div class="card"><small>Σ Grid Devices</small><b>${fmt(s.devices)}</b></div><div class="card"><small>Σ Physical targets</small><b>${fmt(physicalTotal)}</b></div><div class="card"><small>AE2 Grids</small><b>${s.grids.toLocaleString()}</b></div><div class="card"><small>Linked physical</small><b>${s.linked}/${allDevices.length}</b></div>`;
- const top=[...allGrids].sort((a,b)=>valueOf(b,'core')-valueOf(a,'core')).slice(0,20);const tg=document.getElementById('topGrids');tg.innerHTML=gridRows(top);bindGridRows(tg,top);
- const dims=dimensionStats().slice(0,15);document.getElementById('dimensionSummary').innerHTML=`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Dimension</th><th>Grids</th><th>Σ Core</th><th>Share</th><th>Max Core</th><th>Σ Devices</th></tr></thead><tbody>${dims.map(x=>`<tr class="clickable"><td class="left dim" title="${esc(x.dimension)}">${esc(dimShort(x.dimension))}</td><td>${x.count}</td><td>${fmt(x.core)}</td><td>${pctText(x.core,s.core)}</td><td>${fmt(x.max)}</td><td>${fmt(x.devices)}</td></tr>`).join('')}</tbody></table></div>`;document.querySelectorAll('#dimensionSummary tbody tr').forEach((tr,i)=>tr.onclick=()=>{document.getElementById('gridDimension').value=dims[i].dimension;switchView('grids')});
- const devices=[...allDevices].sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick));document.getElementById('topDevices').innerHTML=devices.length?deviceRows(devices,20):'<div class="empty">В этом отчёте нет physicalDevices.</div>';
- const pg=physicalByGridStats().slice(0,20);document.getElementById('physicalByGrid').innerHTML=pg.length?`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Grid</th><th>Targets</th><th>Σ physical</th><th>Share</th><th>Max target</th></tr></thead><tbody>${pg.map(x=>`<tr class="${x.gridLabel==='(unlinked)'?'':'clickable'}" data-open-grid="${x.gridLabel==='(unlinked)'?'':esc(x.gridLabel)}"><td class="left">${x.gridLabel==='(unlinked)'?'<span class="muted">unlinked</span>':esc(x.gridLabel)}</td><td>${x.count}</td><td>${fmt(x.total)}</td><td>${pctText(x.total,physicalTotal)}</td><td>${fmt(x.max)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Нет physical devices</div>';
- const types=deviceTypeStats().slice(0,20);document.getElementById('hotspotTypes').innerHTML=types.length?`<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Type</th><th>Positions</th><th>Σ load</th><th>Share</th><th>Avg/call</th></tr></thead><tbody>${types.map(x=>`<tr><td class="left clip" title="${esc(x.type)}">${esc(x.type)}</td><td>${x.count}</td><td>${fmt(x.total)}</td><td>${pctText(x.total,physicalTotal)}</td><td>${fmtCall(x.avgCall)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">Нет данных</div>';
-}
+function deviceRows(devices,limit=0){const arr=limit?devices.slice(0,limit):devices;const total=globalPhysicalTotal();const rows=arr.map(d=>{const dp=devicePattern(d);return `<tr><td class="left clip" title="${esc(d.type)}">${badge(d.metric?.usPerTick)} <b>${esc(d.type||'unknown')}</b></td><td>${fmt(d.metric?.usPerTick)}</td><td>${pctText(d.metric?.usPerTick,total)}</td><td class="left">${patternPill(dp)}</td><td>${fmtCall(avgCallUs(d.metric))}</td><td>${fmtCall(spikeVal(d,'p50Us'))}</td><td>${fmtCall(spikeVal(d,'p95Us'))}</td><td>${fmtCall(spikeVal(d,'p99Us'))}</td><td>${fmtCall(spikeVal(d,'maxUs'))}</td><td>${n(spikeOf(d)?.callsSeen).toLocaleString()}</td><td>${calls(d.metric?.callsPerTick)}</td><td>${gridLink(d.gridLabel)}</td><td class="left dim" title="${esc(d.dimension)}">${esc(dimShort(d.dimension))}</td><td>${esc(posText(d.position))}</td><td>${coordActions(d.dimension,d.position)}</td></tr>`}).join('');return `<div class="table-scroll compact"><table class="data-table"><thead><tr><th>Physical device</th><th>Load</th><th>Share</th><th class="left">Pattern</th><th>Avg</th><th>P50</th><th>P95</th><th>P99</th><th>Max</th><th>Samples</th><th>Calls</th><th>Grid</th><th class="left">Dimension</th><th>Position</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`}
+function simpleDeviceHtml(d){const load=n(d.metric?.usPerTick),dp=devicePattern(d);return `<div class="simple-device"><div><b>${esc(humanType(d.type))}</b><div class="where">${esc(dimShort(d.dimension))} · ${esc(posText(d.position))} · ${d.gridLabel?esc(d.gridLabel):'unlinked'}</div></div><div><b>${fmt(load)}</b><div class="muted">${fmtCall(avgCallUs(d.metric))}</div></div><div>${patternPill(dp)}<div class="muted" style="margin-top:4px">${esc(dp.reason)}</div></div><div class="simple-actions">${coordActions(d.dimension,d.position)}${d.gridLabel&&gridByLabel(d.gridLabel)?`<button data-open-grid="${esc(d.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}
+function renderSimple(){renderAdminReport();renderSimpleCompare()}
 function applyGridFilters(sync=true){if(sync){gridState.q=document.getElementById('gridSearch').value.trim().toLowerCase();gridState.dimension=document.getElementById('gridDimension').value;gridState.min=Math.max(0,n(document.getElementById('gridMin').value));gridState.sort=document.getElementById('gridSort').value;gridState.top=parseInt(document.getElementById('gridTop').value||'0',10)||0;gridState.active=document.getElementById('gridActive').checked}
- let arr=allGrids.filter(g=>{if(gridState.dimension!=='*'&&(g.dimension||'unknown')!==gridState.dimension)return false;if(valueOf(g,'core')<gridState.min)return false;if(gridState.active&&valueOf(g,'devices')<=0)return false;if(gridState.q){const hay=`${g.label} ${g.dimension} ${anchorText(g)}`.toLowerCase();if(!hay.includes(gridState.q))return false}return true});const matched=arr.length;arr.sort((a,b)=>valueOf(b,gridState.sort)-valueOf(a,gridState.sort)||valueOf(b,'core')-valueOf(a,'core'));if(gridState.top>0)arr=arr.slice(0,gridState.top);gridFiltered=arr;if(!selectedGrid||!arr.includes(selectedGrid))selectedGrid=arr[0]||null;renderGridStatus(matched);renderGridList();renderSelection();renderGridDetail();saveUiState()}
-function renderGridStatus(matched){document.getElementById('gridStatus').innerHTML=`<span>Показано <strong>${gridFiltered.length}</strong> из <strong>${allGrids.length}</strong></span><span>Фильтру соответствуют: ${matched}</span><span>Core ≥ ${gridState.min} µs/t</span>`}
+ let arr=allGrids.filter(g=>{if(gridState.dimension!=='*'&&(g.dimension||'unknown')!==gridState.dimension)return false;if(valueOf(g,'core')<gridState.min)return false;if(gridState.active&&valueOf(g,'devices')<=0)return false;if(gridState.q){const hay=`${g.label} ${g.dimension} ${anchorText(g)}`.toLowerCase();if(!hay.includes(gridState.q))return false}return true});const matched=arr.length;arr.sort((a,b)=>gridState.sort==='priority'?gridPriorityScore(b)-gridPriorityScore(a):valueOf(b,gridState.sort)-valueOf(a,gridState.sort)||valueOf(b,'core')-valueOf(a,'core'));if(gridState.top>0)arr=arr.slice(0,gridState.top);gridFiltered=arr;if(!selectedGrid||!arr.includes(selectedGrid))selectedGrid=arr[0]||null;renderGridStatus(matched);renderGridList();renderSelection();renderGridDetail();saveUiState()}
+function renderGridStatus(matched){document.getElementById('gridStatus').innerHTML=`<span>Показано <strong>${gridFiltered.length}</strong> из <strong>${allGrids.length}</strong> detailed grids</span><span>Observed globally: <strong>${globalStats().grids}</strong></span><span>Фильтру соответствуют: ${matched}</span><span>Core ≥ ${gridState.min} µs/t</span>`}
 function renderGridList(){const root=document.getElementById('gridList');if(!gridFiltered.length){root.innerHTML='<div class="panel empty">По текущему фильтру сетей нет.</div>';return}root.innerHTML=gridRows(gridFiltered);root.querySelectorAll('tbody tr').forEach((tr,i)=>{if(gridFiltered[i]===selectedGrid)tr.classList.add('selected');tr.onclick=e=>{if(e.target.closest('[data-copy-text]'))return;selectedGrid=gridFiltered[i];renderGridList();renderSelection();renderGridDetail()}})}
 function renderSelection(){const g=selectedGrid,root=document.getElementById('selectionSummary');if(!g){root.innerHTML='<div class="empty">Сеть не выбрана</div>';return}const ds=dispatchStats(g),risk=observerRisk(g);root.innerHTML=`<div class="muted">${esc(g.label)} · ${esc(dimShort(g.dimension))}</div><div class="big">${fmt(valueOf(g,'core'))}</div><div class="kv"><span>Devices</span><b>${fmt(valueOf(g,'devices'))}</b><span>Scheduler</span><b>${fmt(valueOf(g,'scheduler'))}</b><span>Grid remainder*</span><b>${fmt(valueOf(g,'overhead'))}</b><span>Foreign dispatch</span><b>${ds.foreignCount} · ${fmt(ds.foreignLoad)}</b><span>Observer-risk*</span><b class="${observerRiskClass(risk)}">${esc(observerRiskText(risk))}</b><span>Services</span><b>${fmt(valueOf(g,'services'))}</b><span>Anchor</span><b>${esc(anchorText(g))}</b></div><div class="mode-hint">* Remainder и observer-risk — диагностические производные; self-time profiler отдельно не измеряется.</div><div style="margin-top:10px">${coordActions(g.dimension,g.anchor)}</div>`}
-function renderGridDetail(){const g=selectedGrid,root=document.getElementById('gridDetail');if(!g){root.innerHTML='';return}const m=g.metrics||{},tm=g.tickManager,core=Math.max(1,n(m.gridCore?.usPerTick)),ds=dispatchStats(g),risk=observerRisk(g),conc=physicalConcentration(g);let html=`<div class="meta coord-line"><span>${esc(g.dimension)}</span><span>anchor: ${esc(anchorText(g))}</span>${coordActions(g.dimension,g.anchor)}</div><div class="cards"><div class="card"><small>Grid Core</small><b>${fmt(m.gridCore?.usPerTick)}</b></div><div class="card"><small>Devices</small><b>${fmt(m.devices?.usPerTick)}</b></div><div class="card"><small>Scheduler</small><b>${fmt(tm?.schedulerRemainder?.usPerTick)}</b></div><div class="card"><small>Grid remainder*</small><b>${fmt(m.gridOverhead?.usPerTick)}</b></div><div class="card"><small>Foreign dispatch</small><b>${fmt(ds.foreignLoad)}</b><small>${ds.foreignCount} levels</small></div><div class="card"><small>Observer-risk*</small><b class="${observerRiskClass(risk)}">${esc(observerRiskText(risk))}</b><small>${calls(risk.callsPerTick)} lifecycle</small></div><div class="card"><small>Services</small><b>${fmt(m.gridServices?.usPerTick)}</b></div></div><div class="note observer-note"><b>* Interpretation:</b> Grid remainder = Grid Core − Grid Services. Он не является чистым "AE2 overhead": туда может попадать реальная работа Grid и стоимость instrumentation. Observer-risk — консервативная эвристика, а не измеренный self-time profiler.${conc.activeCount>=5&&conc.physicalShare>=70?` Top ${conc.topCount} physical targets дают ${conc.physicalShare.toFixed(1)}% physical load этой Grid (${fmt(conc.topTotal)} из ${fmt(conc.physicalTotal)}).`:''}</div>`;
+function renderGridDetail(){const g=selectedGrid,root=document.getElementById('gridDetail');if(!g){root.innerHTML='';return}const m=g.metrics||{},tm=g.tickManager,core=Math.max(1,n(m.gridCore?.usPerTick)),ds=dispatchStats(g),risk=observerRisk(g),conc=physicalConcentration(g),gp=gridPattern(g);let html=`<div class="meta coord-line"><span>${esc(g.dimension)}</span><span>anchor: ${esc(anchorText(g))}</span>${coordActions(g.dimension,g.anchor)}</div><div class="cards"><div class="card"><small>Grid Core</small><b>${fmt(m.gridCore?.usPerTick)}</b></div><div class="card"><small>Devices</small><b>${fmt(m.devices?.usPerTick)}</b></div><div class="card"><small>Scheduler</small><b>${fmt(tm?.schedulerRemainder?.usPerTick)}</b></div><div class="card"><small>Grid remainder*</small><b>${fmt(m.gridOverhead?.usPerTick)}</b></div><div class="card"><small>Foreign dispatch</small><b>${fmt(ds.foreignLoad)}</b><small>${ds.foreignCount} levels</small></div><div class="card"><small>Observer-risk*</small><b class="${observerRiskClass(risk)}">${esc(observerRiskText(risk))}</b><small>${calls(risk.callsPerTick)} lifecycle</small></div><div class="card"><small>Services</small><b>${fmt(m.gridServices?.usPerTick)}</b></div><div class="card"><small>Diagnostic pattern</small><b>${esc(gp.label)}</b><small>confidence: ${esc(gp.confidence)}</small></div></div><div class="note observer-note"><b>* Interpretation:</b> Grid remainder = Grid Core − Grid Services. Он не является чистым "AE2 overhead": туда может попадать реальная работа Grid и стоимость instrumentation. Observer-risk — консервативная эвристика, а не измеренный self-time profiler.${conc.activeCount>=5&&conc.physicalShare>=70?` Top ${conc.topCount} physical targets дают ${conc.physicalShare.toFixed(1)}% physical load этой Grid (${fmt(conc.topTotal)} из ${fmt(conc.physicalTotal)}).`:''}</div><section><div class="panel-head"><h2>Диагностическая классификация Grid</h2><span class="muted">report-derived classification</span></div><div>${patternPill(gp)}</div><div class="simple-why">${esc(gp.reason)}</div><div class="meta"><span>Core: <b>${fmt(gp.core)}</b></span><span>Services: <b>${fmt(gp.services)}</b></span><span>Scheduler: <b>${fmt(gp.scheduler)}</b></span><span>Grid devices: <b>${fmt(gp.devices)}</b></span><span>Foreign dispatch: <b>${fmt(gp.foreign)}</b></span><span>Exact physical: <b>${fmt(gp.physical)}</b></span></div></section>`;
  html+=section('Overview',metric('Grid Core (inclusive)',m.gridCore,core,0,true)+metric('Grid Services (sum)',m.gridServices,core,1)+metric('Grid remainder* (derived)',m.gridOverhead,core,1)+metric('Devices',m.devices,core,1));const services=(g.services||[]).slice().sort((a,b)=>n(b.total?.usPerTick)-n(a.total?.usPerTick));html+=section('Services',services.map(s=>metric(`${s.name} · ${s.className}`,s.total,Math.max(1,n(m.gridServices?.usPerTick)))).join(''));const gridDevices=allDevices.filter(d=>d.gridLabel===g.label).sort((a,b)=>n(b.metric?.usPerTick)-n(a.metric?.usPerTick));html+=section(`Top physical devices in ${g.label}`,gridDevices.length?deviceRows(gridDevices,25):'<div class="empty">Для этой Grid физические timing targets пока не связаны. Пассивные или неактивные устройства могут остаться unlinked.</div>');
- let adv='';const cp=g.corePhases||{};adv+=section('Grid Core phases',metric('Server start',cp.server_start,core)+metric('Level start',cp.level_start,core)+metric('Level end',cp.level_end,core)+metric('Server end',cp.server_end,core));if(tm){const max=Math.max(1,n(tm.service?.usPerTick));adv+=section('Tick Manager',metric('Service (inclusive)',tm.service,max,0,true)+metric('Level queue',tm.levelQueue,max,1)+metric('Queue (inclusive)',tm.queue,max,1,true)+metric('Devices',tm.devices,max,2)+metric('Scheduler remainder',tm.schedulerRemainder,max,2,true)+metric('Queue residual + guard',tm.queueResidual,max,2)+metric('Level dispatch overhead',tm.levelDispatchOverhead,max,1)+metric('Outer overhead',tm.outerOverhead,max,1));const dl=(tm.dispatchLevels||[]).slice().sort((a,b)=>n(b.total?.callsPerTick)-n(a.total?.callsPerTick)||n(b.total?.usPerTick)-n(a.total?.usPerTick));if(dl.length){const same=dl.filter(x=>x.anchorDimension),foreign=dl.filter(x=>!x.anchorDimension);const sum=(arr,key)=>arr.reduce((a,x)=>a+n(x.total?.[key]),0);adv+=`<section><h2>Actual Level dispatch</h2><div class="meta"><span>Levels: <b>${dl.length}</b></span><span class="anchor">Anchor: ${same.length} · ${fmt(sum(same,'usPerTick'))}</span><span class="foreign">Foreign: ${foreign.length} · ${fmt(sum(foreign,'usPerTick'))}</span></div><div class="dispatch-scroll"><table class="data-table"><thead><tr><th>Actual Level</th><th>Relation</th><th>Total</th><th>Calls</th><th>LevelEnd</th></tr></thead><tbody>${dl.map(x=>`<tr><td class="left dim" title="${esc(x.dimension)}">${esc(dimShort(x.dimension))}</td><td class="${x.anchorDimension?'anchor':'foreign'}">${x.anchorDimension?'anchor':'foreign'}</td><td>${fmt(x.total?.usPerTick)}</td><td>${calls(x.total?.callsPerTick)}</td><td>${fmt(x.levelEnd?.usPerTick)}</td></tr>`).join('')}</tbody></table></div></section>`}const q=tm.queuePhases||{},qmax=Math.max(1,n(tm.queue?.usPerTick));adv+=section('Tick Queue phases',metric('Head due-check',q.headDueCheck,qmax)+metric('Poll + dequeue prep',q.dequeuePrep,qmax)+metric('Tick-rate update',q.rateUpdate,qmax)+metric('Awake-map check',q.awakeCheck,qmax)+metric('PriorityQueue reinsert',q.reinsert,qmax)+metric('Sleep branch',q.sleepBranch,qmax)+metric('Future-head stop',q.futureStop,qmax));const c=tm.controls||{};adv+=section('Controls (nested)',metric('Sleep',c.sleep,max)+metric('Wake',c.wake,max)+metric('Alert',c.alert,max));const mods=tm.modulation||{};adv+=`<section><h2>Tick modulation</h2><div class="mods">${Object.entries(mods).map(([k,v])=>`<div class="mod"><span class="muted">${esc(k)}</span><strong>${calls(v.perTick)}</strong><span class="muted">${n(v.count).toLocaleString()} calls</span></div>`).join('')}</div></section>`}html+=`<details class="advanced"><summary>Advanced diagnostics · Tick Manager / queue / Level dispatch</summary><div class="advanced-body">${adv}</div></details>`;root.innerHTML=html}
-function applyDeviceFilters(sync=true){if(sync){deviceState.q=document.getElementById('deviceSearch').value.trim().toLowerCase();deviceState.dimension=document.getElementById('deviceDimension').value;deviceState.min=Math.max(0,n(document.getElementById('deviceMin').value));deviceState.sort=document.getElementById('deviceSort').value;deviceState.top=parseInt(document.getElementById('deviceTop').value||'0',10)||0}let arr=allDevices.filter(d=>{if(deviceState.dimension!=='*'&&(d.dimension||'unknown')!==deviceState.dimension)return false;if(n(d.metric?.usPerTick)<deviceState.min)return false;if(deviceState.q){const hay=`${d.type} ${d.gridLabel||''} ${d.dimension} ${posText(d.position)}`.toLowerCase();if(!hay.includes(deviceState.q))return false}return true});const matched=arr.length;arr.sort((a,b)=>deviceState.sort==='avg'?avgCallUs(b.metric)-avgCallUs(a.metric):deviceState.sort==='calls'?n(b.metric?.callsPerTick)-n(a.metric?.callsPerTick):deviceState.sort==='p99'?spikeVal(b,'p99Us')-spikeVal(a,'p99Us'):deviceState.sort==='max'?spikeVal(b,'maxUs')-spikeVal(a,'maxUs'):deviceState.sort==='type'?String(a.type).localeCompare(String(b.type)):n(b.metric?.usPerTick)-n(a.metric?.usPerTick));if(deviceState.top>0)arr=arr.slice(0,deviceState.top);deviceFiltered=arr;document.getElementById('deviceStatus').innerHTML=`<span>Показано <strong>${arr.length}</strong> из <strong>${allDevices.length}</strong> physical devices</span><span>Фильтру соответствуют: ${matched}</span><span>Load ≥ ${deviceState.min} µs/t</span><span>Linked: ${arr.filter(d=>d.gridLabel).length}</span>`;renderTypeSummary();document.getElementById('deviceList').innerHTML=arr.length?deviceRows(arr):'<div class="panel empty">Нет physical devices по текущему фильтру.</div>';saveUiState()}
+ let adv='';const cp=g.corePhases||{};adv+=section('Grid Core phases',metric('Server start',cp.server_start,core)+metric('Level start',cp.level_start,core)+metric('Level end',cp.level_end,core)+metric('Server end',cp.server_end,core));if(tm){const max=Math.max(1,n(tm.service?.usPerTick));adv+=section('Tick Manager',metric('Service (inclusive)',tm.service,max,0,true)+metric('Level queue',tm.levelQueue,max,1)+metric('Queue (inclusive)',tm.queue,max,1,true)+metric('Devices',tm.devices,max,2)+metric('Scheduler remainder',tm.schedulerRemainder,max,2,true)+metric('Queue residual + guard',tm.queueResidual,max,2)+metric('Level dispatch overhead',tm.levelDispatchOverhead,max,1)+metric('Outer overhead',tm.outerOverhead,max,1));const dl=(tm.dispatchLevels||[]).slice().sort((a,b)=>n(b.total?.callsPerTick)-n(a.total?.callsPerTick)||n(b.total?.usPerTick)-n(a.total?.usPerTick));if(dl.length){const same=dl.filter(x=>x.anchorDimension),foreign=dl.filter(x=>!x.anchorDimension);const sum=(arr,key)=>arr.reduce((a,x)=>a+n(x.total?.[key]),0);adv+=`<section><h2>Actual Level dispatch</h2><div class="meta"><span>Levels: <b>${n(tm.dispatchLevelsTotal)||dl.length}</b>${n(tm.dispatchLevelsOmitted)>0?` · shown ${dl.length}`:''}</span><span class="anchor">Anchor shown: ${same.length}</span><span class="foreign">Foreign shown: ${foreign.length}</span></div><div class="dispatch-scroll"><table class="data-table"><thead><tr><th>Actual Level</th><th>Relation</th><th>Total</th><th>Calls</th><th>LevelEnd</th></tr></thead><tbody>${dl.map(x=>`<tr><td class="left dim" title="${esc(x.dimension)}">${esc(dimShort(x.dimension))}</td><td class="${x.anchorDimension?'anchor':'foreign'}">${x.anchorDimension?'anchor':'foreign'}</td><td>${fmt(x.total?.usPerTick)}</td><td>${calls(x.total?.callsPerTick)}</td><td>${fmt(x.levelEnd?.usPerTick)}</td></tr>`).join('')}</tbody></table></div></section>`}const q=tm.queuePhases||{},qmax=Math.max(1,n(tm.queue?.usPerTick));adv+=section('Tick Queue phases',metric('Head due-check',q.headDueCheck,qmax)+metric('Poll + dequeue prep',q.dequeuePrep,qmax)+metric('Tick-rate update',q.rateUpdate,qmax)+metric('Awake-map check',q.awakeCheck,qmax)+metric('PriorityQueue reinsert',q.reinsert,qmax)+metric('Sleep branch',q.sleepBranch,qmax)+metric('Future-head stop',q.futureStop,qmax));const c=tm.controls||{};adv+=section('Controls (nested)',metric('Sleep',c.sleep,max)+metric('Wake',c.wake,max)+metric('Alert',c.alert,max));const mods=tm.modulation||{};adv+=`<section><h2>Tick modulation</h2><div class="mods">${Object.entries(mods).map(([k,v])=>`<div class="mod"><span class="muted">${esc(k)}</span><strong>${calls(v.perTick)}</strong><span class="muted">${n(v.count).toLocaleString()} calls</span></div>`).join('')}</div></section>`}html+=`<details class="advanced"><summary>Advanced diagnostics · Tick Manager / queue / Level dispatch</summary><div class="advanced-body">${adv}</div></details>`;root.innerHTML=html}
+function applyDeviceFilters(sync=true){if(sync){deviceState.q=document.getElementById('deviceSearch').value.trim().toLowerCase();deviceState.dimension=document.getElementById('deviceDimension').value;deviceState.min=Math.max(0,n(document.getElementById('deviceMin').value));deviceState.sort=document.getElementById('deviceSort').value;deviceState.top=parseInt(document.getElementById('deviceTop').value||'0',10)||0}let arr=allDevices.filter(d=>{if(deviceState.dimension!=='*'&&(d.dimension||'unknown')!==deviceState.dimension)return false;if(n(d.metric?.usPerTick)<deviceState.min)return false;if(deviceState.q){const hay=`${d.type} ${d.gridLabel||''} ${d.dimension} ${posText(d.position)}`.toLowerCase();if(!hay.includes(deviceState.q))return false}return true});const matched=arr.length;arr.sort((a,b)=>deviceState.sort==='priority'?devicePriorityScore(b)-devicePriorityScore(a):deviceState.sort==='avg'?avgCallUs(b.metric)-avgCallUs(a.metric):deviceState.sort==='calls'?n(b.metric?.callsPerTick)-n(a.metric?.callsPerTick):deviceState.sort==='p99'?spikeVal(b,'p99Us')-spikeVal(a,'p99Us'):deviceState.sort==='max'?spikeVal(b,'maxUs')-spikeVal(a,'maxUs'):deviceState.sort==='type'?String(a.type).localeCompare(String(b.type)):n(b.metric?.usPerTick)-n(a.metric?.usPerTick));if(deviceState.top>0)arr=arr.slice(0,deviceState.top);deviceFiltered=arr;document.getElementById('deviceStatus').innerHTML=`<span>Показано <strong>${arr.length}</strong> из <strong>${allDevices.length}</strong> detailed devices</span><span>Observed globally: <strong>${observedPhysicalCount()}</strong></span><span>Фильтру соответствуют: ${matched}</span><span>Load ≥ ${deviceState.min} µs/t</span><span>Linked in shown set: ${arr.filter(d=>d.gridLabel).length}</span>`;renderTypeSummary();document.getElementById('deviceList').innerHTML=arr.length?deviceRows(arr):'<div class="panel empty">Нет physical devices по текущему фильтру.</div>';saveUiState()}
 function renderTypeSummary(){const map=new Map();for(const d of allDevices){const k=d.type||'unknown';let x=map.get(k);if(!x){x={type:k,count:0,total:0,max:0,calls:0};map.set(k,x)}const v=n(d.metric?.usPerTick);x.count++;x.total+=v;x.max=Math.max(x.max,v);x.calls+=n(d.metric?.callsPerTick)}const top=[...map.values()].sort((a,b)=>b.total-a.total).slice(0,15);document.getElementById('typeSummary').innerHTML=top.length?`<div class="type-grid">${top.map(x=>`<div class="type-card"><small>${esc(x.type)}</small><strong>${fmt(x.total)}</strong><small>${x.count} positions · max ${fmt(x.max)} · ${calls(x.calls)}</small></div>`).join('')}</div>`:''}
-const reportTotal=(r,kind)=>kind==='physical'?[...(r?.physicalDevices||[])].reduce((a,d)=>a+n(d.metric?.usPerTick),0):[...(r?.grids||[])].reduce((a,g)=>a+n(g.metrics?.gridCore?.usPerTick),0);
+const reportTotal=(r,kind)=>{const key=kind==='physical'?'physicalUsPerTick':'gridCoreUsPerTick',gv=Number(r?.globalTotals?.[key]);if(Number.isFinite(gv))return gv;return kind==='physical'?[...(r?.physicalDevices||[])].reduce((a,d)=>a+n(d.metric?.usPerTick),0):[...(r?.grids||[])].reduce((a,g)=>a+n(g.metrics?.gridCore?.usPerTick),0)};
+const gridTotalScope=r=>r?.globalTotals?.gridTotalsScope||'full-profile';
+const gridTotalsComparable=(a,b)=>{const as=gridTotalScope(a),bs=gridTotalScope(b);if(as!==bs)return false;if(as!=='scout-estimate')return true;return n(a?.globalTotals?.gridMetricTicks)===n(b?.globalTotals?.gridMetricTicks)};
 function gridDeviceSets(reportObj){const map=new Map();for(const d of (reportObj?.physicalDevices||[])){if(!d.gridLabel)continue;let set=map.get(d.gridLabel);if(!set){set=new Set();map.set(d.gridLabel,set)}set.add(deviceKey(d))}return map}
 """);
         html.append("""
@@ -1541,15 +1946,15 @@ const pctChange=x=>x.status==='new'?'NEW':x.status==='gone'?'GONE':Number.isFini
 function filterDiff(arr){let out=arr.filter(x=>{if(compareState.kind==='regressions'&&!(x.status==='regression'||x.status==='new'))return false;if(compareState.kind==='improvements'&&x.status!=='improvement')return false;if(compareState.kind==='new'&&x.status!=='new')return false;if(compareState.kind==='gone'&&x.status!=='gone')return false;if(x.status!=='new'&&x.status!=='gone'&&Math.abs(x.pct)<compareState.minPct)return false;if(Math.abs(x.delta)<compareState.minAbs)return false;return true});out.sort((a,b)=>compareState.sort==='pct'?(Math.abs(Number.isFinite(b.pct)?b.pct:1e12)-Math.abs(Number.isFinite(a.pct)?a.pct:1e12)):compareState.sort==='current'?b.cv-a.cv:compareState.sort==='baseline'?b.bv-a.bv:b.delta-a.delta);if(compareState.top>0)out=out.slice(0,compareState.top);return out}
 function gridCompareRows(rows){if(!rows.length)return '<div class="empty">Нет Grid, подходящих под фильтр.</div>';const body=rows.map(x=>{const g=x.cur||x.base,pos=g?.anchor,dim=g?.dimension||'unknown',labels=x.cur&&x.base&&x.cur.label!==x.base.label?`${esc(x.base.label)} → ${esc(x.cur.label)}`:esc(g?.label||'');return `<tr><td class="left"><span class="status-pill ${deltaClass(x)}">${x.status}</span> ${x.cur?`<button class="grid-link" data-open-grid="${esc(x.cur.label)}">${labels}</button>`:labels}<div class="muted">${esc(gridMatchText(x))}</div><div class="muted">${esc(gridRegressionInsight(x))}</div></td><td>${fmt(x.cv)}</td><td>${fmt(x.bv)}</td><td class="${deltaClass(x)}">${deltaText(x.delta)}</td><td class="${deltaClass(x)}">${pctChange(x)}</td><td class="left dim" title="${esc(dim)}">${esc(dimShort(dim))}</td><td>${esc(posText(pos))}</td><td>${coordActions(dim,pos)}</td></tr>`}).join('');return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Grid</th><th>Current</th><th>Baseline</th><th>Δ Core</th><th>Change</th><th>Dimension</th><th>Anchor</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>`}
 function deviceCompareRows(rows){if(!rows.length)return '<div class="empty">Нет устройств, подходящих под фильтр.</div>';const body=rows.map(x=>{const d=x.cur||x.base,pos=d?.position,dim=d?.dimension||'unknown';return `<tr><td class="left clip"><span class="status-pill ${deltaClass(x)}">${x.status}</span> <b>${esc(d?.type||'unknown')}</b><div class="muted">${esc(deviceRegressionInsight(x))}</div></td><td>${fmt(x.cv)}</td><td>${fmt(x.bv)}</td><td class="${deltaClass(x)}">${deltaText(x.delta)}</td><td class="${deltaClass(x)}">${pctChange(x)}</td><td>${x.cur?gridLink(x.cur.gridLabel):'<span class="muted">—</span>'}</td><td class="left dim" title="${esc(dim)}">${esc(dimShort(dim))}</td><td>${esc(posText(pos))}</td><td>${coordActions(dim,pos)}</td></tr>`}).join('');return `<div class="table-scroll"><table class="data-table"><thead><tr><th>Device</th><th>Current</th><th>Baseline</th><th>Δ Load</th><th>Change</th><th>Grid</th><th>Dimension</th><th>Position</th><th>Actions</th></tr></thead><tbody>${body}</tbody></table></div>`}
-function renderCompare(){if(!baselineReport){document.getElementById('compareMeta').innerHTML='<span>Baseline не выбран.</span>';document.getElementById('compareCards').innerHTML='';document.getElementById('compareInsights').innerHTML='<div class="empty">Выбери baseline JSON.</div>';document.getElementById('compareGridList').innerHTML='<div class="empty">Выбери baseline JSON.</div>';document.getElementById('compareDeviceList').innerHTML='<div class="empty">Выбери baseline JSON.</div>';return}const gd=gridDiffRows(report,baselineReport),dd=diffRows(allDevices,baselineReport.physicalDevices||[],deviceKey,d=>n(d.metric?.usPerTick));const gf=filterDiff(gd),df=filterDiff(dd);const cg=reportTotal(report,'grid'),bg=reportTotal(baselineReport,'grid'),cp=reportTotal(report,'physical'),bp=reportTotal(baselineReport,'physical');const gdlt=cg-bg,pdlt=cp-bp,fingerprint=gd.filter(x=>x.matchKind==='devices').length,samplingCompare=(report.sampling?.largeServerMode||baselineReport.sampling?.largeServerMode)?'<span class=\"plain-warn\">Grid/service side includes Large Server weighted estimates; physical device timings remain exact.</span>':'';renderRegressionInsights(gd,dd);document.getElementById('compareMeta').innerHTML=`${samplingCompare}<span>Current: <b>${esc(report.generatedAt||'this report')}</b></span><span>Baseline: <b>${esc(baselineName||baselineReport.generatedAt||'selected JSON')}</b></span><span>Grid match: unique anchor first; changed/duplicate anchors → unambiguous ≥80% physical-device fingerprint</span><span>Duplicate anchor groups: <b>${duplicateAnchorGroups(allGrids)}</b> current / <b>${duplicateAnchorGroups(baselineReport.grids||[])}</b> baseline</span><span>Fingerprint fallback matched: <b>${fingerprint}</b></span><span>Devices: dimension + type + position</span>`;document.getElementById('compareCards').innerHTML=`<div class="card"><small>Grid Core Current</small><b>${fmt(cg)}</b></div><div class="card"><small>Grid Core Δ</small><b class="${gdlt>0?'delta-up':gdlt<0?'delta-down':''}">${deltaText(gdlt)}</b></div><div class="card"><small>Physical Current</small><b>${fmt(cp)}</b></div><div class="card"><small>Physical Δ</small><b class="${pdlt>0?'delta-up':pdlt<0?'delta-down':''}">${deltaText(pdlt)}</b></div><div class="card"><small>New / Gone</small><b>${gd.filter(x=>x.status==='new').length+dd.filter(x=>x.status==='new').length} / ${gd.filter(x=>x.status==='gone').length+dd.filter(x=>x.status==='gone').length}</b></div>`;document.getElementById('compareGridList').innerHTML=gridCompareRows(gf);document.getElementById('compareDeviceList').innerHTML=deviceCompareRows(df)}
-function renderSimpleCompare(){const meta=document.getElementById('simpleCompareMeta'),box=document.getElementById('simpleCompare');if(!baselineReport){meta.innerHTML='<span>Прошлый профиль не выбран.</span>';box.innerHTML='';return}const gd=gridDiffRows(report,baselineReport),dd=diffRows(allDevices,baselineReport.physicalDevices||[],deviceKey,d=>n(d.metric?.usPerTick)),cg=reportTotal(report,'grid'),bg=reportTotal(baselineReport,'grid'),delta=cg-bg,pct=bg>0?delta/bg*100:0;const samplingCompare=(report.sampling?.largeServerMode||baselineReport.sampling?.largeServerMode)?'<span class=\"plain-warn\">Grid side содержит weighted estimates Large Server mode.</span>':'';meta.innerHTML=`${samplingCompare}<span>Сравниваем с: <b>${esc(baselineName||baselineReport.generatedAt||'baseline')}</b></span><span>Grid identity fallback: <b>${gd.filter(x=>x.matchKind==='devices').length}</b></span><span>Повторяющиеся anchors: <b>${duplicateAnchorGroups(allGrids)}</b> / <b>${duplicateAnchorGroups(baselineReport.grids||[])}</b></span>`;const worseG=gd.filter(x=>x.status==='regression').sort((a,b)=>b.delta-a.delta).slice(0,5),betterG=gd.filter(x=>x.status==='improvement').sort((a,b)=>a.delta-b.delta).slice(0,3),worseD=dd.filter(x=>x.status==='regression').sort((a,b)=>b.delta-a.delta).slice(0,5);const summary=delta>0?`AE2 в этом профиле тяжелее на ${fmt(Math.abs(delta))} (${pct.toFixed(1)}%).`:delta<0?`AE2 в этом профиле легче на ${fmt(Math.abs(delta))} (${Math.abs(pct).toFixed(1)}%).`:'Суммарная AE2-нагрузка почти не изменилась.';const gridItems=worseG.map(x=>{const g=x.cur||x.base;return `<div class="simple-issue"><h3>Сеть стала тяжелее · ${esc(g?.label||'')}</h3><div class="simple-load delta-up">+${fmt(x.delta)}</div><div class="simple-why">Было ${fmt(x.bv)}, стало ${fmt(x.cv)}. ${esc(gridMatchText(x))}<div class="muted" style="margin-top:6px">${esc(gridRegressionInsight(x))}</div></div><div class="simple-actions">${x.cur?coordActions(x.cur.dimension,x.cur.anchor):''}${x.cur?`<button data-open-grid="${esc(x.cur.label)}">Подробнее</button>`:''}</div></div>`}).join('');const deviceItems=worseD.map(x=>{const d=x.cur||x.base;return `<div class="simple-device"><div><b>${esc(humanType(d?.type))}</b><div class="where">${esc(dimShort(d?.dimension))} · ${esc(posText(d?.position))}</div></div><div><b class="delta-up">+${fmt(x.delta)}</b><div class="muted">${fmt(x.bv)} → ${fmt(x.cv)}</div></div><div>${x.cur&&x.base&&x.delta>0?esc(deviceRegressionInsight(x)):x.cur?esc(deviceFrequencyText(x.cur)):''}</div><div class="simple-actions">${coordActions(d?.dimension,d?.position)}${x.cur?.gridLabel?`<button data-open-grid="${esc(x.cur.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}).join('');const improved=betterG.length?`<div class="muted" style="margin-top:10px">Стало легче: ${betterG.map(x=>`${esc((x.cur||x.base)?.label)} ${deltaText(x.delta)}`).join(' · ')}</div>`:'';box.innerHTML=`<div class="simple-compare-summary ${delta>0?'delta-up':delta<0?'delta-down':''}"><b>${summary}</b></div>${gridItems?`<h3>Что сильнее всего ухудшилось</h3><div class="simple-issues">${gridItems}</div>`:'<div class="plain-good">Сильных регрессий Grid не найдено.</div>'}${deviceItems?`<h3 style="margin-top:14px">Какие устройства стали тяжелее</h3><div class="simple-list">${deviceItems}</div>`:''}${improved}`}
+function renderCompare(){if(!baselineReport){document.getElementById('compareMeta').innerHTML='<span>Baseline не выбран.</span>';document.getElementById('compareCards').innerHTML='';document.getElementById('compareInsights').innerHTML='<div class="empty">Выбери baseline JSON.</div>';document.getElementById('compareGridList').innerHTML='<div class="empty">Выбери baseline JSON.</div>';document.getElementById('compareDeviceList').innerHTML='<div class="empty">Выбери baseline JSON.</div>';return}const gd=gridDiffRows(report,baselineReport),dd=diffRows(allDevices,baselineReport.physicalDevices||[],deviceKey,d=>n(d.metric?.usPerTick));const gf=filterDiff(gd),df=filterDiff(dd);const cg=reportTotal(report,'grid'),bg=reportTotal(baselineReport,'grid'),cp=reportTotal(report,'physical'),bp=reportTotal(baselineReport,'physical');const gdlt=cg-bg,pdlt=cp-bp,fingerprint=gd.filter(x=>x.matchKind==='devices').length,samplingCompare=(report.sampling?.largeServerMode||baselineReport.sampling?.largeServerMode)?'<span class=\"plain-warn\">Grid/service side includes Large Server weighted estimates; physical device timings remain exact.</span>':'',scopeCompare=gridTotalsComparable(report,baselineReport)?'':`<span class=\"plain-warn\">Grid Core global scopes differ (${esc(gridTotalScope(report))} vs ${esc(gridTotalScope(baselineReport))}); global Grid Δ is not apples-to-apples. Physical Δ remains comparable.</span>`;renderRegressionInsights(gd,dd);document.getElementById('compareMeta').innerHTML=`${samplingCompare}${scopeCompare}<span>Current: <b>${esc(report.generatedAt||'this report')}</b></span><span>Baseline: <b>${esc(baselineName||baselineReport.generatedAt||'selected JSON')}</b></span><span>Grid match: unique anchor first; changed/duplicate anchors → unambiguous ≥80% physical-device fingerprint</span><span>Duplicate anchor groups: <b>${duplicateAnchorGroups(allGrids)}</b> current / <b>${duplicateAnchorGroups(baselineReport.grids||[])}</b> baseline</span><span>Fingerprint fallback matched: <b>${fingerprint}</b></span><span>Devices: dimension + type + position</span>`;document.getElementById('compareCards').innerHTML=`<div class="card"><small>Grid Core Current</small><b>${fmt(cg)}</b></div><div class="card"><small>Grid Core Δ</small><b class="${gridTotalsComparable(report,baselineReport)?(gdlt>0?'delta-up':gdlt<0?'delta-down':''):'plain-warn'}">${gridTotalsComparable(report,baselineReport)?deltaText(gdlt):'N/A · scope differs'}</b></div><div class="card"><small>Physical Current</small><b>${fmt(cp)}</b></div><div class="card"><small>Physical Δ</small><b class="${pdlt>0?'delta-up':pdlt<0?'delta-down':''}">${deltaText(pdlt)}</b></div><div class="card"><small>New / Gone</small><b>${gd.filter(x=>x.status==='new').length+dd.filter(x=>x.status==='new').length} / ${gd.filter(x=>x.status==='gone').length+dd.filter(x=>x.status==='gone').length}</b></div>`;document.getElementById('compareGridList').innerHTML=gridCompareRows(gf);document.getElementById('compareDeviceList').innerHTML=deviceCompareRows(df)}
+function renderSimpleCompare(){const meta=document.getElementById('simpleCompareMeta'),box=document.getElementById('simpleCompare');if(!baselineReport){meta.innerHTML='<span>Прошлый профиль не выбран.</span>';box.innerHTML='';return}const gd=gridDiffRows(report,baselineReport),dd=diffRows(allDevices,baselineReport.physicalDevices||[],deviceKey,d=>n(d.metric?.usPerTick)),cg=reportTotal(report,'grid'),bg=reportTotal(baselineReport,'grid'),delta=cg-bg,pct=bg>0?delta/bg*100:0,gridComparable=gridTotalsComparable(report,baselineReport);const samplingCompare=(report.sampling?.largeServerMode||baselineReport.sampling?.largeServerMode)?'<span class=\"plain-warn\">Grid side содержит weighted estimates Large Server mode.</span>':'';meta.innerHTML=`${samplingCompare}<span>Сравниваем с: <b>${esc(baselineName||baselineReport.generatedAt||'baseline')}</b></span><span>Grid identity fallback: <b>${gd.filter(x=>x.matchKind==='devices').length}</b></span><span>Повторяющиеся anchors: <b>${duplicateAnchorGroups(allGrids)}</b> / <b>${duplicateAnchorGroups(baselineReport.grids||[])}</b></span>`;const worseG=gd.filter(x=>x.status==='regression').sort((a,b)=>b.delta-a.delta).slice(0,5),betterG=gd.filter(x=>x.status==='improvement').sort((a,b)=>a.delta-b.delta).slice(0,3),worseD=dd.filter(x=>x.status==='regression').sort((a,b)=>b.delta-a.delta).slice(0,5);const summary=!gridComparable?'Глобальный Grid Core нельзя корректно сравнить: профили используют разный scope (full-profile/scout-estimate). Physical devices и совпавшие detailed grids сравнивать можно.':delta>0?`AE2 в этом профиле тяжелее на ${fmt(Math.abs(delta))} (${pct.toFixed(1)}%).`:delta<0?`AE2 в этом профиле легче на ${fmt(Math.abs(delta))} (${Math.abs(pct).toFixed(1)}%).`:'Суммарная AE2-нагрузка почти не изменилась.';const gridItems=worseG.map(x=>{const g=x.cur||x.base;return `<div class="simple-issue"><h3>Сеть стала тяжелее · ${esc(g?.label||'')}</h3><div class="simple-load delta-up">+${fmt(x.delta)}</div><div class="simple-why">Было ${fmt(x.bv)}, стало ${fmt(x.cv)}. ${esc(gridMatchText(x))}<div class="muted" style="margin-top:6px">${esc(gridRegressionInsight(x))}</div></div><div class="simple-actions">${x.cur?coordActions(x.cur.dimension,x.cur.anchor):''}${x.cur?`<button data-open-grid="${esc(x.cur.label)}">Подробнее</button>`:''}</div></div>`}).join('');const deviceItems=worseD.map(x=>{const d=x.cur||x.base;return `<div class="simple-device"><div><b>${esc(humanType(d?.type))}</b><div class="where">${esc(dimShort(d?.dimension))} · ${esc(posText(d?.position))}</div></div><div><b class="delta-up">+${fmt(x.delta)}</b><div class="muted">${fmt(x.bv)} → ${fmt(x.cv)}</div></div><div>${x.cur&&x.base&&x.delta>0?esc(deviceRegressionInsight(x)):x.cur?esc(deviceFrequencyText(x.cur)):''}</div><div class="simple-actions">${coordActions(d?.dimension,d?.position)}${x.cur?.gridLabel&&gridByLabel(x.cur.gridLabel)?`<button data-open-grid="${esc(x.cur.gridLabel)}">Открыть сеть</button>`:''}</div></div>`}).join('');const improved=betterG.length?`<div class="muted" style="margin-top:10px">Стало легче: ${betterG.map(x=>`${esc((x.cur||x.base)?.label)} ${deltaText(x.delta)}`).join(' · ')}</div>`:'';box.innerHTML=`<div class="simple-compare-summary ${delta>0?'delta-up':delta<0?'delta-down':''}"><b>${summary}</b></div>${gridItems?`<h3>Что сильнее всего ухудшилось</h3><div class="simple-issues">${gridItems}</div>`:'<div class="plain-good">Сильных регрессий Grid не найдено.</div>'}${deviceItems?`<h3 style="margin-top:14px">Какие устройства стали тяжелее</h3><div class="simple-list">${deviceItems}</div>`:''}${improved}`}
 function syncCompareState(){compareState.kind=document.getElementById('compareKind').value;compareState.sort=document.getElementById('compareSort').value;compareState.minPct=Math.max(0,n(document.getElementById('comparePct').value));compareState.minAbs=Math.max(0,n(document.getElementById('compareAbs').value));compareState.top=parseInt(document.getElementById('compareTop').value||'0',10)||0;saveUiState();renderCompare()}
 async function loadBaselineFile(file,openExpert=false){if(!file)return;try{const text=await file.text();const parsed=JSON.parse(text);if(!parsed||!Array.isArray(parsed.grids))throw new Error('JSON does not contain grids[]');baselineReport=parsed;baselineName=file.name||'';renderSimpleCompare();if(openExpert){setSiteMode('expert',false);switchView('compare')}else renderSimple()}catch(e){baselineReport=null;baselineName='';document.getElementById('compareMeta').innerHTML=`<span class="delta-up">Не удалось открыть baseline: ${esc(e.message||e)}</span>`;document.getElementById('simpleCompareMeta').innerHTML=`<span class="delta-up">Не удалось открыть baseline: ${esc(e.message||e)}</span>`;renderCompare();renderSimpleCompare()}}
-function copySummary(){const s=globalStats();if(currentView==='grids'&&selectedGrid){const g=selectedGrid;return `${g.label}: Core ${fmt(valueOf(g,'core'))}, Devices ${fmt(valueOf(g,'devices'))}, Scheduler ${fmt(valueOf(g,'scheduler'))}, Remainder ${fmt(valueOf(g,'overhead'))}, ${g.dimension} @ ${anchorText(g)}`}return `AE2 Overview: ${allGrids.length} grids, Σ Core ${fmt(s.core)}, Σ Devices ${fmt(s.devices)}, Σ Scheduler ${fmt(s.scheduler)}, ${s.dims} dimensions, ${allDevices.length} physical devices`}
+function copySummary(){if(siteMode==='simple')return adminSummaryText();const s=globalStats();if(currentView==='grids'&&selectedGrid){const g=selectedGrid;return `${g.label}: Core ${fmt(valueOf(g,'core'))}, Devices ${fmt(valueOf(g,'devices'))}, Scheduler ${fmt(valueOf(g,'scheduler'))}, Remainder ${fmt(valueOf(g,'overhead'))}, ${g.dimension} @ ${anchorText(g)}`}return `AE2 Overview: ${s.grids} grids, Grid Core ${fmt(s.core)}${globalTotals.gridTotalsScope==='scout-estimate'?' (scout estimate)':''}, Grid Devices ${fmt(s.devices)}, Scheduler ${fmt(s.scheduler)}, ${s.dims} dimensions, ${observedPhysicalCount()} physical devices`}
 
 const gridDims=[...new Set(allGrids.map(g=>g.dimension||'unknown'))].sort((a,b)=>a.localeCompare(b));const deviceDims=[...new Set(allDevices.map(d=>d.dimension||'unknown'))].sort((a,b)=>a.localeCompare(b));populateDimensionSelect('gridDimension',gridDims);populateDimensionSelect('deviceDimension',deviceDims);
 restoreUiState();syncStateToControls();
-const samp=report.sampling||{},driveCov=report.driveCoverage||{};document.getElementById('reportMeta').innerHTML=`<span>Профиль: ${n(report.profileTicks).toLocaleString()} ticks</span><span>Grids: ${allGrids.length}</span><span>Physical devices: ${allDevices.length}</span><span>Linked: ${allDevices.filter(d=>d.gridLabel).length}</span><span>Dimensions: ${new Set(allGrids.map(g=>g.dimension||'unknown')).size}</span>${Object.keys(driveCov).length?`<span>ME Drive: <b>${n(driveCov.activeDriveTargets)}/${n(driveCov.physicalDriveTargets)}</b> active · unresolved ops <b>${n(driveCov.operations?.unresolvedBegins).toLocaleString()}</b></span>`:''}${samp.largeServerMode?`<span class=\"plain-warn\">Large Server mode · ${n(samp.levelLifecycleCallbacksSeenPerProfileTick).toFixed(0)} Level callbacks/t · ~1/${n(samp.effectiveSampleFactor).toFixed(1)} sampled · max shard ${n(samp.maxSampleFactor)}x${n(samp.skippedByBudget)>0?` · budget-skip ${n(samp.skippedByBudget).toLocaleString()}`:''}</span>`:`<span class=\"plain-good\">Exact Grid lifecycle mode</span>`}<span>${esc(report.generatedAt||'')}</span>`;
+const samp=report.sampling||{},driveCov=report.driveCoverage||{},gs=globalStats(),obsPhys=observedPhysicalCount(),expGrids=n(reportLimits.exportedGrids)||allGrids.length,obsGrids=n(reportLimits.observedGrids)||gs.grids,expPhys=n(reportLimits.exportedPhysicalDevices)||allDevices.length,omittedGrids=Math.max(0,n(reportLimits.omittedGrids)),omittedPhys=Math.max(0,n(reportLimits.omittedPhysicalDevices));document.getElementById('reportMeta').innerHTML=`<span>Профиль: ${n(report.profileTicks).toLocaleString()} ticks${n(report.profileWallClockMs)>0?` · ${(n(report.profileWallClockMs)/1000).toFixed(1)}s · ~${n(report.observedProfileTps).toFixed(1)} TPS`:``}</span><span>Grid detail: <b>${expGrids.toLocaleString()}/${obsGrids.toLocaleString()}</b></span><span>Physical detail: <b>${expPhys.toLocaleString()}/${obsPhys.toLocaleString()}</b></span><span>Linked: ${gs.linked.toLocaleString()}/${obsPhys.toLocaleString()}</span><span>Dimensions: ${gs.dims.toLocaleString()}</span>${omittedGrids||omittedPhys?`<span class=\"plain-warn\">Compact report · omitted detail: ${omittedGrids.toLocaleString()} grids / ${omittedPhys.toLocaleString()} devices</span>`:''}${Object.keys(driveCov).length?`<span>ME Drive: <b>${n(driveCov.activeDriveTargets)}/${n(driveCov.physicalDriveTargets)}</b> active · unresolved ops <b>${n(driveCov.operations?.unresolvedBegins).toLocaleString()}</b></span>`:''}${samp.largeServerMode?`<span class=\"plain-warn\">Large Server mode · ${n(samp.levelLifecycleCallbacksSeenPerProfileTick).toFixed(0)} Level callbacks/t · ~1/${n(samp.effectiveSampleFactor).toFixed(1)} sampled · max shard ${n(samp.maxSampleFactor)}x${n(samp.skippedByBudget)>0?` · budget-skip ${n(samp.skippedByBudget).toLocaleString()}`:''}</span>`:`<span class=\"plain-good\">Exact Grid lifecycle mode</span>`}${runtimeSelection.selectionFrozen?`<span class=\"plain-good\">Runtime Top-N: <b>${n(runtimeSelection.selectedGrids)}</b> after ${n(runtimeSelection.scoutTicks)} scout ticks · kept ${n(runtimeSelection.gridLifecycleCallbacksKeptAfterCap).toLocaleString()} / skipped ${n(runtimeSelection.gridLifecycleCallbacksSkippedByCap).toLocaleString()} Grid callbacks after cap</span>`:''}${globalTotals.gridTotalsScope==='scout-estimate'?`<span class=\"plain-warn\">Global Grid totals = ${n(globalTotals.gridMetricTicks)}-tick scout estimate; physical total = full profile</span>`:''}<span>${esc(report.generatedAt||'')}</span>`;
 document.getElementById('simpleModeBtn').onclick=()=>setSiteMode('simple');document.getElementById('expertModeBtn').onclick=()=>setSiteMode('expert');document.querySelectorAll('.nav-tabs button').forEach(b=>b.onclick=()=>switchView(b.dataset.view));
 document.getElementById('jsonBtn').onclick=()=>{location.href=location.href.replace(/\\.html(?:[?#].*)?$/i,'.json')};document.getElementById('copyBtn').onclick=async()=>{const txt=copySummary();try{await navigator.clipboard.writeText(txt);document.getElementById('copyBtn').textContent='Скопировано';setTimeout(()=>document.getElementById('copyBtn').textContent='Копировать сводку',1200)}catch(e){prompt('Скопируй сводку:',txt)}};
 ['gridSearch','gridDimension','gridMin','gridSort','gridTop','gridActive'].forEach(id=>{const el=document.getElementById(id);el.addEventListener(id==='gridSearch'||id==='gridMin'?'input':'change',()=>applyGridFilters())});document.getElementById('gridShowAll').onclick=()=>{document.getElementById('gridSearch').value='';document.getElementById('gridDimension').value='*';document.getElementById('gridMin').value='0';document.getElementById('gridSort').value='core';document.getElementById('gridTop').value='0';document.getElementById('gridActive').checked=false;applyGridFilters()};
@@ -1592,7 +1997,7 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
             }
         }
 
-        for (GridSnapshot snapshot : snapshotsSorted()) {
+        for (GridSnapshot snapshot : reportGridSnapshots(snapshotsSorted(), requestedReportGridLimit())) {
             if (snapshot.gridCoreNanos <= 0L || snapshot.gridCoreCalls <= 0
                     || snapshot.anchorEntity == null || snapshot.virtualBase == null
                     || !(snapshot.anchorEntity.getLevel() instanceof ServerLevel)) {
@@ -1612,18 +2017,44 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
         indent(out, 2).append("\"inactiveDriveTargets\": ").append(Math.max(0, coverage.physicalDriveTargets - coverage.activeDriveTargets)).append(",\n");
         indent(out, 2).append("\"resolver\": {")
                 .append("\"resolutionAttempts\": ").append(resolver.resolutionAttempts).append(", ")
-                .append("\"fallbackResolutionAttempts\": ").append(resolver.resolutionAttempts).append(", ")
+                .append("\"fallbackResolutionAttempts\": ").append(Math.max(0L, resolver.resolutionAttempts - resolver.resolvedRecordedOwner - resolver.resolvedStorageMountOwner)).append(", ")
                 .append("\"resolvedWatchers\": ").append(resolver.resolvedWatchers).append(", ")
                 .append("\"unresolvedWatchers\": ").append(resolver.unresolvedWatchers).append(", ")
                 .append("\"unresolvedWatcherIdentities\": ").append(resolver.unresolvedWatchers).append(", ")
                 .append("\"uniqueResolvedDrives\": ").append(resolver.uniqueResolvedDrives).append(", ")
                 .append("\"resolvedByDirectOwner\": ").append(resolver.resolvedDirect).append(", ")
                 .append("\"resolvedByCallbackCapture\": ").append(resolver.resolvedCallback).append(", ")
+                .append("\"resolvedByRecordedOwner\": ").append(resolver.resolvedRecordedOwner).append(", ")
+                .append("\"resolvedByRecordedSnapshot\": ").append(resolver.resolvedRecordedSnapshot).append(", ")
+                .append("\"resolvedByStorageMountOwner\": ").append(resolver.resolvedStorageMountOwner).append(", ")
+                .append("\"hotPathSessionCache\": true, ")
+                .append("\"hotPathAllocationFreeStack\": true, ")
+                .append("\"hotPathTimingStateInitializations\": ").append(resolver.hotPathTimingStateInitializations).append(", ")
+                .append("\"sessionPhysicalPreparations\": ").append(resolver.sessionPhysicalPreparations).append(", ")
+                .append("\"storageMountOwnerEntries\": ").append(resolver.storageMountOwnerEntries).append(", ")
+                .append("\"storageMountOwnerEntriesAtSessionStart\": ").append(resolver.storageMountOwnerEntriesAtSessionStart).append(", ")
+                .append("\"storageProviderMountPasses\": ").append(resolver.storageProviderMountPasses).append(", ")
+                .append("\"storageMountWatchersSeen\": ").append(resolver.storageMountWatchersSeen).append(", ")
+                .append("\"storageMountAccessFailures\": ").append(resolver.storageMountAccessFailures).append(", ")
+                .append("\"mountProviderIdentityEntries\": ").append(resolver.mountProviderIdentityEntries).append(", ")
+                .append("\"passiveOwnerHistory\": true, ")
+                .append("\"recordedOwnerEntries\": ").append(resolver.recordedOwnerEntries).append(", ")
+                .append("\"recordedOwnerEntriesAtSessionStart\": ").append(resolver.recordedOwnerEntriesAtSessionStart).append(", ")
+                .append("\"constructorOwnerCaptures\": ").append(resolver.constructorOwnerCaptures).append(", ")
+                .append("\"recordedOwnerUpdates\": ").append(resolver.recordedOwnerUpdates).append(", ")
+                .append("\"recordedOwnerAccessFailures\": ").append(resolver.recordedOwnerAccessFailures).append(", ")
                 .append("\"resolvedByHostMapping\": ").append(resolver.resolvedHostMapping).append(", ")
                 .append("\"preMappedWatchers\": ").append(resolver.resolvedHostMapping).append(", ")
                 .append("\"hostMappingScans\": ").append(resolver.hostMappingScans).append(", ")
                 .append("\"hostMappingWatchersSeen\": ").append(resolver.hostMappingWatchersSeen).append(", ")
                 .append("\"hostMappingAccessFailures\": ").append(resolver.hostMappingAccessFailures).append(", ")
+                .append("\"stableCellResolutionAttempts\": ").append(resolver.stableCellResolutionAttempts).append(", ")
+                .append("\"resolvedByCellDelegateIdentity\": ").append(resolver.resolvedCellDelegateIdentity).append(", ")
+                .append("\"resolvedByCellStackIdentity\": ").append(resolver.resolvedCellStackIdentity).append(", ")
+                .append("\"resolvedByCellUuid\": ").append(resolver.resolvedCellUuid).append(", ")
+                .append("\"cellDelegateOwnerEntries\": ").append(resolver.cellDelegateOwnerEntries).append(", ")
+                .append("\"cellStackOwnerEntries\": ").append(resolver.cellStackOwnerEntries).append(", ")
+                .append("\"cellUuidOwnerEntries\": ").append(resolver.cellUuidOwnerEntries).append(", ")
                 .append("\"typedCellResolutionAttempts\": ").append(resolver.cellResolutionAttempts).append(", ")
                 .append("\"resolvedByCellSaveProvider\": ").append(resolver.resolvedCellSaveProvider).append(", ")
                 .append("\"cellDelegateTypeBasic\": ").append(resolver.cellDelegateBasic).append(", ")
@@ -1642,6 +2073,18 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
                 .append("\"accessFailure\": ").append(resolver.unresolvedAccessFailure).append(", ")
                 .append("\"directOwnerNotDrive\": ").append(resolver.unresolvedDirectOwnerNotDrive).append(", ")
                 .append("\"other\": ").append(resolver.unresolvedOther).append("}, ")
+                .append("\"unresolvedMountProviderTypes\": [");
+        int mountProviderTypeIndex = 0;
+        for (Map.Entry<String, Long> entry : resolver.unresolvedMountProviderTypes.entrySet()) {
+            if (mountProviderTypeIndex++ > 0) {
+                out.append(',');
+            }
+            out.append('{')
+                    .append("\"type\": ").append(jsonQuote(entry.getKey())).append(", ")
+                    .append("\"watchers\": ").append(entry.getValue())
+                    .append('}');
+        }
+        out.append("], ")
                 .append("\"unresolvedDelegateTypes\": [");
         int delegateTypeIndex = 0;
         for (Map.Entry<String, Long> entry : resolver.unresolvedDelegateTypes.entrySet()) {
@@ -1674,17 +2117,120 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
         indent(out, 1).append("},\n");
     }
 
-    private static String buildDetailedReportJson(List<GridSnapshot> snapshots, List<PhysicalDeviceSnapshot> physicalDevices, DriveCoverageReportSnapshot driveCoverage, int profileTicks) {
+    private static String buildDetailedReportJson(
+            List<GridSnapshot> allSnapshots, List<GridSnapshot> snapshots,
+            List<PhysicalDeviceSnapshot> allPhysicalDevices, List<PhysicalDeviceSnapshot> physicalDevices,
+            DriveCoverageReportSnapshot driveCoverage, int profileTicks, int gridLimit, int physicalDeviceLimit) {
         StringBuilder out = new StringBuilder(Math.max(4096, snapshots.size() * 4096));
         out.append("{\n");
-        // format remains the data-schema compatibility ID so v20.1/v18 baselines keep working.
+        // format remains the data-schema compatibility ID so older v18 baselines keep working.
         jsonField(out, 1, "format", "observable-ae2-grid-v18", true);
         jsonNumberField(out, 1, "schemaVersion", 18, true);
-        jsonField(out, 1, "profilerVersion", "20.3.2.7", true);
+        jsonField(out, 1, "profilerVersion", "20.5.3", true);
         jsonField(out, 1, "generatedAt", Instant.now().toString(), true);
         jsonNumberField(out, 1, "profileTicks", profileTicks, true);
+        long profileWallClockMs = Math.max(1L, System.currentTimeMillis() - sessionStartedWallMillis);
+        jsonNumberField(out, 1, "profileWallClockMs", profileWallClockMs, true);
+        indent(out, 1).append("\"observedProfileTps\": ")
+                .append(String.format(Locale.ROOT, "%.6f", profileTicks * 1000.0 / profileWallClockMs))
+                .append(",\n");
         jsonField(out, 1, "note",
-                "Inclusive/nested metrics must not be summed. Grid Core contains services; Tick Manager contains queue/devices. v20.3.2.7 keeps v20.3.2.6 Large Server Safety, Profiler Correctness, Drive Coverage Diagnostics, and precomputed Drive owner mapping, removes the real-world-ineffective lazy host rescan from the DriveWatcher miss path, and adds a strictly typed AE2 15.5.0 cell-owner fallback: exact DelegatingMEInventory.delegate -> exact BasicCellInventory.container (ISaveProvider) -> direct lambda capture of DriveBlockEntity. It invokes no AE2 methods, follows no arbitrary fields, adds no new mixin targets, does not widen resolver depth, and keeps recursive storage-graph reflection forbidden (at most 10 ae2-grid JSON/HTML files, pruned as report groups). Unsupported delegate classes are counted diagnostically and skipped fail-soft. Modes are inferred only from sufficiently populated sample splits and are diagnostic, not proof of a specific AE2 branch. Physical device compat timing/spikes remain exact and are not shard-sampled. Exact max/top events still observe every physical call; total percentiles use a 2048-sample reservoir and per-operation percentiles use a 512-sample reservoir only after their exact capacities are exceeded. Current Diagnosis, observer-risk, Regression Intelligence Compare, and duplicate-anchor-safe identity remain available.", true);
+                "Inclusive/nested metrics must not be summed. Grid Core contains services; Tick Manager contains queue/devices. v20.5.3 keeps the proven v20.5.2/v20.4.1/v20.3.2.16 collection, Drive ownership, hot-path behavior and Admin UI unchanged, while adding an administration-only consistency guard. The Admin Report still detects large one-off physical outliers and estimates exported physical background after removing known top outliers for triage only, and now refuses confident TickManager/device attribution when remainder is a dominant majority of Grid Core or nested inclusive buckets contradict their measured parent hierarchy. These are report-derived heuristics over existing measurements, not new timing hooks or replacements for the raw metrics. All previous technical diagnostics remain available in Expert mode. No new AE2 injection points are added. AE2 profiling remains opt-in with the 4-tick scout Top-N runtime detail cap. Drive ownership remains authoritative through StorageService.ProviderState.mount() for both appeng DriveBlockEntity and ExtendedAE TileExDrive. Exact Drive call counts, elapsed storage time and spike recording remain enabled. profileWallClockMs and observedProfileTps describe the observed profiling window and are diagnostic rather than a baseline TPS measurement. Compact report limits remain in place. When runtime selection freezes, global Grid totals are a scout-window estimate; physical timing/spikes remain full-profile.", true);
+
+        long globalGridCoreNanos = 0L;
+        long globalServiceNanos = 0L;
+        long globalDeviceNanos = 0L;
+        long globalSchedulerNanos = 0L;
+        Set<String> globalDimensions = new HashSet<>();
+        for (GridSnapshot snapshot : allSnapshots) {
+            globalGridCoreNanos += Math.max(0L, snapshot.gridCoreNanos);
+            globalServiceNanos += Math.max(0L, snapshot.serviceTotalNanos);
+            globalDeviceNanos += Math.max(0L, snapshot.deviceNanos);
+            if (snapshot.tickManager != null) {
+                globalSchedulerNanos += Math.max(0L, snapshot.tickManager.queueBookkeepingNanos);
+            }
+            globalDimensions.add(snapshotDimension(snapshot));
+        }
+        int globalGridMetricTicks = profileTicks;
+        boolean globalGridTotalsFromScout = false;
+        if (runtimeSelectionFrozen && runtimeScoutTicks > 0) {
+            globalGridCoreNanos = runtimeScoutGridCoreNanos;
+            globalServiceNanos = runtimeScoutServiceNanos;
+            globalDeviceNanos = runtimeScoutDeviceNanos;
+            globalSchedulerNanos = runtimeScoutSchedulerNanos;
+            globalGridMetricTicks = runtimeScoutTicks;
+            globalGridTotalsFromScout = true;
+        }
+
+        long globalPhysicalNanos = 0L;
+        int globalLinkedPhysical = 0;
+        for (PhysicalDeviceSnapshot device : allPhysicalDevices) {
+            globalPhysicalNanos += Math.max(0L, device.nanos);
+            if (device.gridLabel != null && !device.gridLabel.isBlank()) {
+                globalLinkedPhysical++;
+            }
+        }
+
+        indent(out, 1).append("\"diagnosticModel\": {")
+                .append("\"version\": ").append(jsonQuote("20.5.3")).append(", ")
+                .append("\"classificationScope\": ").append(jsonQuote("report-derived")).append(", ")
+                .append("\"newInjectionPoints\": false, ")
+                .append("\"physicalTiming\": ").append(jsonQuote("exact-full-profile")).append(", ")
+                .append("\"gridDetailScope\": ").append(jsonQuote(runtimeSelectionFrozen ? "runtime-top-n-after-scout" : "full-profile")).append(", ")
+                .append("\"foreignDispatchRole\": ").append(jsonQuote("secondary-signal")).append(", ")
+                .append("\"physicalGridAggregateScope\": ").append(jsonQuote("exported-physical-lower-bound-when-compact")).append(", ")
+                .append("\"burstDetection\": ").append(jsonQuote("call-count-aware-millisecond-stall")).append(", ")
+                .append("\"adminReport\": ").append(jsonQuote("human-readable-triage-top5")).append(", ")
+                .append("\"adminReportCollection\": ").append(jsonQuote("report-derived-no-new-hooks")).append(", ")
+                 .append("\"adminUiHotfix\": ").append(jsonQuote("escaped-newline-js-initialization")).append(", ")
+                .append("\"adminAccuracy\": ").append(jsonQuote("spike-adjusted-sustained-and-consistency-triage")).append(", ")
+                .append("\"adminRemainderGuard\": ").append(jsonQuote("majority-or-strongly-dominant-remainder-overrides-attribution")).append(", ")
+                .append("\"adminConsistencyGuard\": ").append(jsonQuote("inclusive-hierarchy-mismatch-downgrades-attribution")).append(", ")
+                .append("\"adminPriorityModel\": ").append(jsonQuote("impact-ranked-cause-confidence-separated")).append(", ")
+                .append("\"deviceOutlierModel\": ").append(jsonQuote("primary-pattern-plus-large-outlier"))
+                .append("},\n");
+
+        indent(out, 1).append("\"reportLimits\": {")
+                .append("\"requestedGridLimit\": ").append(gridLimit).append(", ")
+                .append("\"observedGrids\": ").append(allSnapshots.size()).append(", ")
+                .append("\"exportedGrids\": ").append(snapshots.size()).append(", ")
+                .append("\"omittedGrids\": ").append(Math.max(0, allSnapshots.size() - snapshots.size())).append(", ")
+                .append("\"physicalDeviceLimit\": ").append(physicalDeviceLimit).append(", ")
+                .append("\"observedPhysicalDevices\": ").append(allPhysicalDevices.size()).append(", ")
+                .append("\"exportedPhysicalDevices\": ").append(physicalDevices.size()).append(", ")
+                .append("\"omittedPhysicalDevices\": ").append(Math.max(0, allPhysicalDevices.size() - physicalDevices.size())).append(", ")
+                .append("\"dispatchLevelsPerGrid\": ").append(REPORT_DISPATCH_LEVEL_LIMIT)
+                .append("},\n");
+
+        indent(out, 1).append("\"runtimeSelection\": {")
+                .append("\"mode\": ").append(jsonQuote("scout-top-n-runtime-detail")).append(", ")
+                .append("\"scoutTicksTarget\": ").append(RUNTIME_GRID_SCOUT_TICKS).append(", ")
+                .append("\"scoutTicks\": ").append(runtimeScoutTicks).append(", ")
+                .append("\"selectionFrozen\": ").append(runtimeSelectionFrozen).append(", ")
+                .append("\"discoveredAtFreeze\": ").append(runtimeDiscoveredAtFreeze).append(", ")
+                .append("\"selectedGrids\": ").append(runtimeSelectedGridCount).append(", ")
+                .append("\"gridLifecycleCallbacksSkippedByCap\": ").append(runtimeGridLifecycleSkippedByCap).append(", ")
+                .append("\"gridLifecycleCallbacksKeptAfterCap\": ").append(runtimeGridLifecycleKeptAfterCap).append(", ")
+                .append("\"globalGridTotalsScope\": ").append(jsonQuote(globalGridTotalsFromScout ? "scout-estimate" : "full-profile")).append(", ")
+                .append("\"physicalTimingScope\": ").append(jsonQuote("all-observed-full-profile"))
+                .append("},\n");
+
+        double gridNanosToUsPerTick = globalGridMetricTicks <= 0 ? 0.0 : 1.0 / (1000.0 * globalGridMetricTicks);
+        double physicalNanosToUsPerTick = profileTicks <= 0 ? 0.0 : 1.0 / (1000.0 * profileTicks);
+        indent(out, 1).append("\"globalTotals\": {")
+                .append("\"gridTotalsScope\": ").append(jsonQuote(globalGridTotalsFromScout ? "scout-estimate" : "full-profile")).append(", ")
+                .append("\"gridMetricTicks\": ").append(globalGridMetricTicks).append(", ")
+                .append("\"observedGrids\": ").append(allSnapshots.size()).append(", ")
+                .append("\"observedDimensions\": ").append(globalDimensions.size()).append(", ")
+                .append("\"observedPhysicalDevices\": ").append(allPhysicalDevices.size()).append(", ")
+                .append("\"linkedPhysicalDevices\": ").append(globalLinkedPhysical).append(", ")
+                .append("\"gridCoreUsPerTick\": ").append(decimal(globalGridCoreNanos * gridNanosToUsPerTick)).append(", ")
+                .append("\"gridServicesUsPerTick\": ").append(decimal(globalServiceNanos * gridNanosToUsPerTick)).append(", ")
+                .append("\"gridDevicesUsPerTick\": ").append(decimal(globalDeviceNanos * gridNanosToUsPerTick)).append(", ")
+                .append("\"schedulerUsPerTick\": ").append(decimal(globalSchedulerNanos * gridNanosToUsPerTick)).append(", ")
+                .append("\"physicalUsPerTick\": ").append(decimal(globalPhysicalNanos * physicalNanosToUsPerTick))
+                .append("},\n");
+
         SamplingSnapshot sampling = SAMPLING.snapshot();
         indent(out, 1).append("\"sampling\": {")
                 .append("\"largeServerMode\": ").append(sampling.largeServerMode).append(", ")
@@ -1734,11 +2280,8 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
             GridSnapshot snapshot = snapshots.get(i);
             indent(out, 2).append("{\n");
             jsonField(out, 3, "label", snapshot.label, true);
-            String dimension = null;
-            if (snapshot.anchorEntity != null && snapshot.anchorEntity.getLevel() != null) {
-                dimension = snapshot.anchorEntity.getLevel().dimension().location().toString();
-            }
-            jsonField(out, 3, "dimension", dimension == null ? "unknown" : dimension, true);
+            String dimension = snapshotDimension(snapshot);
+            jsonField(out, 3, "dimension", dimension, true);
 
             indent(out, 3).append("\"anchor\": ");
             appendPosition(out, snapshot.anchor);
@@ -1832,8 +2375,29 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
         jsonMetricField(out, indentLevel + 1, "devices", tickManager.deviceNanos,
                 tickManager.deviceCalls, profileTicks, true);
 
+        long dispatchLevelsAggregateNanos = 0L;
+        int dispatchLevelsAggregateCalls = 0;
+        long foreignDispatchAggregateNanos = 0L;
+        int foreignDispatchAggregateCalls = 0;
+        for (LevelDispatchSnapshot dispatch : tickManager.dispatchLevels) {
+            dispatchLevelsAggregateNanos += dispatch.total.nanos;
+            dispatchLevelsAggregateCalls += dispatch.total.calls;
+            if (!dispatch.anchorDimension) {
+                foreignDispatchAggregateNanos += dispatch.total.nanos;
+                foreignDispatchAggregateCalls += dispatch.total.calls;
+            }
+        }
+        jsonMetricField(out, indentLevel + 1, "dispatchLevelsAggregate", dispatchLevelsAggregateNanos,
+                dispatchLevelsAggregateCalls, profileTicks, true);
+        jsonMetricField(out, indentLevel + 1, "foreignDispatchAggregate", foreignDispatchAggregateNanos,
+                foreignDispatchAggregateCalls, profileTicks, true);
+        int dispatchLevelsTotal = tickManager.dispatchLevels.size();
+        int dispatchLevelsExported = Math.min(dispatchLevelsTotal, REPORT_DISPATCH_LEVEL_LIMIT);
+        indent(out, indentLevel + 1).append("\"dispatchLevelsTotal\": ").append(dispatchLevelsTotal).append(",\n");
+        indent(out, indentLevel + 1).append("\"dispatchLevelsOmitted\": ")
+                .append(Math.max(0, dispatchLevelsTotal - dispatchLevelsExported)).append(",\n");
         indent(out, indentLevel + 1).append("\"dispatchLevels\": [\n");
-        for (int i = 0; i < tickManager.dispatchLevels.size(); i++) {
+        for (int i = 0; i < dispatchLevelsExported; i++) {
             LevelDispatchSnapshot dispatch = tickManager.dispatchLevels.get(i);
             indent(out, indentLevel + 2).append("{\n");
             jsonField(out, indentLevel + 3, "dimension", dispatch.dimension, true);
@@ -1846,7 +2410,7 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
             jsonMetricField(out, indentLevel + 3, "levelEnd", dispatch.levelEnd.nanos,
                     dispatch.levelEnd.calls, profileTicks, false);
             indent(out, indentLevel + 2).append('}');
-            if (i + 1 < tickManager.dispatchLevels.size()) {
+            if (i + 1 < dispatchLevelsExported) {
                 out.append(',');
             }
             out.append('\n');
@@ -2084,114 +2648,22 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
     public static void publishVirtualTimings() {
         sessionActive = false;
 
-        List<GridSnapshot> snapshots = snapshotsSorted();
+        // The standalone AE2 report now owns the detailed breakdown. Observable's
+        // normal upload receives only one inclusive marker for the requested Top-N
+        // grids, preventing thousands of grids x dozens of synthetic markers from
+        // bloating the base profile and browser payload.
+        List<GridSnapshot> snapshots = reportGridSnapshots(snapshotsSorted(), requestedReportGridLimit());
         Profiler profiler = Observable.INSTANCE.getPROFILER();
 
         for (GridSnapshot snapshot : snapshots) {
-            if (snapshot.anchorEntity == null || !(snapshot.anchorEntity.getLevel() instanceof ServerLevel)
-                    || snapshot.virtualBase == null) {
+            if (snapshot.gridCoreNanos <= 0L || snapshot.gridCoreCalls <= 0
+                    || snapshot.anchorEntity == null || snapshot.virtualBase == null
+                    || !(snapshot.anchorEntity.getLevel() instanceof ServerLevel)) {
                 continue;
             }
-
-            Level level = snapshot.anchorEntity.getLevel();
-            int slot = 0;
-
-            slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
+            publishMetric(profiler, snapshot.anchorEntity.getLevel(), snapshot.virtualBase, 0,
                     snapshot.label + " / Grid Core (inclusive)",
                     snapshot.gridCoreNanos, snapshot.gridCoreCalls);
-
-            slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                    snapshot.label + " / Grid Services (sum)",
-                    snapshot.serviceTotalNanos, snapshot.serviceTotalCalls);
-
-            slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                    snapshot.label + " / Grid remainder (derived)",
-                    snapshot.gridOverheadNanos, snapshot.gridCoreCalls);
-
-            slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                    snapshot.label + " / Devices (inside Tick Manager)",
-                    snapshot.deviceNanos, snapshot.deviceCalls);
-
-            TickManagerSnapshot tickManager = snapshot.tickManager;
-            if (tickManager != null) {
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Queue (inclusive)",
-                        tickManager.queue.nanos, tickManager.queue.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Scheduler remainder (queue - devices)",
-                        tickManager.queueBookkeepingNanos, tickManager.queue.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Head due-check",
-                        tickManager.headDueCheck.nanos, tickManager.headDueCheck.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Poll + dequeue prep",
-                        tickManager.dequeuePrep.nanos, tickManager.dequeuePrep.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Tick-rate update",
-                        tickManager.rateUpdate.nanos, tickManager.rateUpdate.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Awake-map check",
-                        tickManager.awakeCheck.nanos, tickManager.awakeCheck.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr PriorityQueue reinsert",
-                        tickManager.reinsert.nanos, tickManager.reinsert.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Sleep branch",
-                        tickManager.sleepBranch.nanos, tickManager.sleepBranch.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Future-head stop check",
-                        tickManager.futureStop.nanos, tickManager.futureStop.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Queue residual + guard",
-                        tickManager.queueResidualNanos, tickManager.queue.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Level dispatch overhead",
-                        tickManager.levelDispatchNanos, tickManager.levelQueue.calls);
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Outer overhead",
-                        tickManager.outerOverheadNanos, tickManager.serviceCalls);
-
-                long controlNanos = tickManager.sleep.nanos + tickManager.wake.nanos + tickManager.alert.nanos;
-                int controlCalls = tickManager.sleep.calls + tickManager.wake.calls + tickManager.alert.calls;
-                slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / TickMgr Sleep-Wake-Alert (nested)",
-                        controlNanos, controlCalls);
-            }
-
-            int remaining = MAX_VIRTUAL_MARKERS - slot;
-            if (remaining <= 0) {
-                continue;
-            }
-
-            int serviceLimit = Math.min(snapshot.services.size(), remaining);
-            long omittedNanos = 0L;
-            int omittedCalls = 0;
-
-            // Leave one slot for an omitted aggregate if necessary.
-            if (snapshot.services.size() > serviceLimit && serviceLimit > 0) {
-                serviceLimit--;
-            }
-
-            for (int i = 0; i < snapshot.services.size(); i++) {
-                ServiceSnapshot service = snapshot.services.get(i);
-                if (service.total.nanos <= 0L || service.total.calls <= 0) {
-                    continue;
-                }
-                if (i < serviceLimit) {
-                    slot = publishMetric(profiler, level, snapshot.virtualBase, slot,
-                            snapshot.label + " / Service " + service.displayName,
-                            service.total.nanos, service.total.calls);
-                } else {
-                    omittedNanos += service.total.nanos;
-                    omittedCalls += service.total.calls;
-                }
-            }
-
-            if (omittedNanos > 0L && slot < MAX_VIRTUAL_MARKERS) {
-                publishMetric(profiler, level, snapshot.virtualBase, slot,
-                        snapshot.label + " / Other services (omitted from markers)",
-                        omittedNanos, omittedCalls);
-            }
         }
     }
 
@@ -2770,7 +3242,8 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
                     deviceCalls,
                     services,
                     tickManager,
-                    score);
+                    score,
+                    runtimeGridSelected(info.grid));
         }
     }
 
@@ -3054,7 +3527,7 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
     }
 
     private static final class PhysicalDeviceRef {
-        private final BlockEntity host;
+        private BlockEntity host;
         private final String dimension;
         private final BlockPos position;
         private final SpikeStats spikes = new SpikeStats();
@@ -3864,6 +4337,7 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
         private final List<ServiceSnapshot> services;
         private final TickManagerSnapshot tickManager;
         private final long scoreNanos;
+        private final boolean runtimeDetailed;
 
         private GridSnapshot(String label, BlockPos anchor, BlockEntity anchorEntity, BlockPos virtualBase,
                              long gridCoreNanos, int gridCoreCalls,
@@ -3871,7 +4345,8 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
                              long serviceTotalNanos, int serviceTotalCalls,
                              long gridOverheadNanos,
                              long deviceNanos, int deviceCalls,
-                             List<ServiceSnapshot> services, TickManagerSnapshot tickManager, long scoreNanos) {
+                             List<ServiceSnapshot> services, TickManagerSnapshot tickManager, long scoreNanos,
+                             boolean runtimeDetailed) {
             this.label = label;
             this.anchor = anchor;
             this.anchorEntity = anchorEntity;
@@ -3887,6 +4362,7 @@ renderOverview();applyGridFilters(false);applyDeviceFilters(false);setSiteMode(s
             this.services = services;
             this.tickManager = tickManager;
             this.scoreNanos = scoreNanos;
+            this.runtimeDetailed = runtimeDetailed;
         }
     }
 }

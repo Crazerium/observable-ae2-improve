@@ -96,9 +96,17 @@ class Profiler {
      * The position is intentionally not required to contain a real block; the
      * client already renders block timings by dimension + BlockPos.
      */
-    fun processCompatVirtualBlock(level: Level, pos: BlockPos, name: String): TimingData {
+    fun processCompatVirtualBlock(level: Level, pos: BlockPos, name: String): TimingData =
+        processCompatVirtualBlock(level.dimension(), pos, name)
+
+    /**
+     * Variant for compatibility targets whose original level/chunk has already
+     * unloaded but whose immutable dimension + position identity is still known.
+     * No live Level reference is required to store the timing bucket.
+     */
+    fun processCompatVirtualBlock(dimension: ResourceKey<Level>, pos: BlockPos, name: String): TimingData {
         val data = blockTimingsMap
-            .computeIfAbsent(level.dimension()) { ConcurrentHashMap() }
+            .computeIfAbsent(dimension) { ConcurrentHashMap() }
             .computeIfAbsent(pos) {
                 TimingData(
                     0,
@@ -137,23 +145,31 @@ class Profiler {
                     BuiltInRegistries.FLUID.getKey(fluidState.type).toString()
                 )
             }
-    fun startRunning(sample: Boolean = false) {
+    fun startRunning(
+        sample: Boolean = false,
+        compatEnabled: Boolean = false,
+        compatGridLimit: Int = 0
+    ) {
         timingsMap.clear()
         blockTimingsMap.clear()
         serverTraceMap = TraceMap()
         startTime = System.currentTimeMillis()
         lastCompletedTicks = 0
+        Props.compatProfilerEnabled = compatEnabled
+        Props.compatProfilerGridLimit = if (compatEnabled) compatGridLimit.coerceAtLeast(0) else 0
         synchronized(Props.notProcessing) {
             notProcessing = false
             startingTicks = GameInstance.getServer()!!.tickCount
         }
-        // Loader-specific compatibility profilers must reset at the exact same
-        // session boundary. In particular, do not poll startTime from worker
-        // threads: it is not a synchronization primitive.
-        try {
-            Props.compatProfilerStartHook?.run()
-        } catch (t: Throwable) {
-            Observable.LOGGER.warn("Compatibility profiler start hook failed", t)
+        // Compatibility profilers are explicitly opt-in. Normal Observable
+        // runs keep the AE2 collectors dormant and therefore do not scan or
+        // export ME grids.
+        if (compatEnabled) {
+            try {
+                Props.compatProfilerStartHook?.run()
+            } catch (t: Throwable) {
+                Observable.LOGGER.warn("Compatibility profiler start hook failed", t)
+            }
         }
         if (sample) {
             samplerThread = Thread(TaggedSampler(serverThread))
@@ -173,9 +189,17 @@ class Profiler {
         player: ServerPlayer?,
         duration: Int,
         sample: Boolean
+    ) = runWithDuration(player, duration, sample, false, 0)
+
+    fun runWithDuration(
+        player: ServerPlayer?,
+        duration: Int,
+        sample: Boolean,
+        compatEnabled: Boolean,
+        compatGridLimit: Int
     ) {
         this.player = player
-        startRunning(sample)
+        startRunning(sample, compatEnabled, compatGridLimit)
         val durMs = duration.toLong() * 1000L
         Observable.CHANNEL.sendToPlayers(
             GameInstance.getServer()!!.playerList.players,
@@ -252,18 +276,25 @@ class Profiler {
             ticks = GameInstance.getServer()!!.tickCount - startingTicks
             lastCompletedTicks = ticks
         }
+        val compatEnabled = Props.compatProfilerEnabled
         // Freeze optional compatibility collectors before ProfilingData snapshots
-        // the maps. This lets them publish synthetic entries once, atomically,
-        // instead of mutating virtual block buckets throughout the run.
-        try {
-            Props.compatProfilerSnapshotHook?.run()
-        } catch (t: Throwable) {
-            Observable.LOGGER.warn("Compatibility profiler snapshot hook failed", t)
+        // the maps. Regular Observable runs skip this entire path.
+        if (compatEnabled) {
+            try {
+                Props.compatProfilerSnapshotHook?.run()
+            } catch (t: Throwable) {
+                Observable.LOGGER.warn("Compatibility profiler snapshot hook failed", t)
+            } finally {
+                // Detailed AE2 collection is finished. Keep only the requested
+                // grid-limit value for prepareClientOverlay(); turn off hot-path
+                // compat work before upload/network serialization begins.
+                Props.compatProfilerEnabled = false
+            }
         }
         val players = player?.let { listOf(it) } ?: listOf()
         Observable.CHANNEL.sendToPlayers(players, S2CPacket.ProfilingCompleted)
-        // Keep the complete snapshot (including diagnostic-only compatibility
-        // markers) for the local report and observable.tas.sh upload. Before
+        // Snapshot the normal profile plus the bounded Top-N AE2 markers (when
+        // explicitly requested) for observable.tas.sh upload. Before
         // ProfilingData calculates average rates, make intentionally passive
         // zero-cost buckets JSON-safe (0 ns / 1 synthetic sample => 0.0 rate).
         // This is especially important for visible-but-idle AE2 ME Drives.
@@ -278,11 +309,18 @@ class Profiler {
         Observable.LOGGER.info("Sending to ${players.map { it.gameProfile.name }}")
         val link = uploadProfile(uploadData, diagnostics)
 
-        try {
-            Props.compatProfilerClientViewHook?.run()
-        } catch (t: Throwable) {
-            Observable.LOGGER.warn("Compatibility profiler client-view hook failed", t)
+        if (compatEnabled) {
+            try {
+                Props.compatProfilerClientViewHook?.run()
+            } catch (t: Throwable) {
+                Observable.LOGGER.warn("Compatibility profiler client-view hook failed", t)
+            }
         }
+
+        // Client overlay has consumed the requested Top-N limit; clear all
+        // compatibility session flags before building/sending the client packet.
+        Props.compatProfilerEnabled = false
+        Props.compatProfilerGridLimit = 0
 
         val clientData = ProfilingData.create(timingsMap, blockTimingsMap, ticks, serverTraceMap)
         Observable.CHANNEL.sendToPlayersSplit(players, S2CPacket.ProfilingResult(clientData, link))

@@ -16,6 +16,29 @@ import observable.Observable
 import observable.net.S2CPacket
 import observable.util.MOD_URL_COMPONENT
 
+private const val DEFAULT_AE2_GRID_LIMIT = 128
+private const val MAX_AE2_GRID_LIMIT = 2048
+
+private fun runAe2Profiler(ctx: CommandContext<CommandSourceStack>, duration: Int, gridLimit: Int): Int {
+    if (!Observable.PROFILER.notProcessing) {
+        ctx.source.sendFailure(Component.literal("Observable profiler is already running"))
+        return 0
+    }
+
+    val safeDuration = duration.coerceAtLeast(1)
+    val safeGridLimit = gridLimit.coerceIn(1, MAX_AE2_GRID_LIMIT)
+    Observable.PROFILER.runWithDuration(ctx.source.player, safeDuration, false, true, safeGridLimit)
+    ctx.source.sendSuccess(
+        {
+            Component.literal(
+                "Observable AE2 profiler started for ${safeDuration}s; scout first, then runtime detail is capped to Top $safeGridLimit grids (physical timing stays global)"
+            )
+        },
+        false
+    )
+    return 1
+}
+
 val OBSERVABLE_COMMAND
     get() =
         Commands.literal("observable")
@@ -33,8 +56,9 @@ val OBSERVABLE_COMMAND
             .then(
                 Commands.literal("run")
                     .then(
-                        Commands.argument("duration", IntegerArgumentType.integer()).executes { ctx ->
+                        Commands.argument("duration", IntegerArgumentType.integer(1)).executes { ctx ->
                             val duration = IntegerArgumentType.getInteger(ctx, "duration")
+                            // Regular Observable profile: AE2 compatibility profiling is intentionally disabled.
                             Observable.PROFILER.runWithDuration(ctx.source.player, duration, false)
                             ctx.source.sendSuccess(
                                 { Component.translatable("text.observable.profile_started", duration) },
@@ -42,6 +66,36 @@ val OBSERVABLE_COMMAND
                             )
                             1
                         }
+                    )
+            )
+            .then(
+                Commands.literal("ae2")
+                    .then(
+                        Commands.literal("run")
+                            .then(
+                                Commands.argument("duration", IntegerArgumentType.integer(1)).executes { ctx ->
+                                    runAe2Profiler(
+                                        ctx,
+                                        IntegerArgumentType.getInteger(ctx, "duration"),
+                                        DEFAULT_AE2_GRID_LIMIT
+                                    )
+                                }
+                            )
+                    )
+                    .then(
+                        Commands.argument("grids", IntegerArgumentType.integer(1, MAX_AE2_GRID_LIMIT))
+                            .then(
+                                Commands.literal("run")
+                                    .then(
+                                        Commands.argument("duration", IntegerArgumentType.integer(1)).executes { ctx ->
+                                            runAe2Profiler(
+                                                ctx,
+                                                IntegerArgumentType.getInteger(ctx, "duration"),
+                                                IntegerArgumentType.getInteger(ctx, "grids")
+                                            )
+                                        }
+                                    )
+                            )
                     )
             )
             .then(
@@ -154,7 +208,6 @@ val OBSERVABLE_COMMAND
 fun teleport(ctx: CommandContext<CommandSourceStack>, pos: Vec3) {
     val player = ctx.source.playerOrException
     val level = DimensionArgument.getDimension(ctx, "dim")
-
     player.teleportTo(pos.x, pos.y, pos.z)
     if (level == player.level()) {
         player.connection.teleport(pos.x, pos.y, pos.z, 0F, 0F, setOf())
