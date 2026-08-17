@@ -31,5 +31,13 @@
   "text.observable.maxEntityCount": "Максимальное кол-во сущностей: ",
   "text.observable.status.new": "Длительность: %s секунд (скролл для смены)",
   "text.observable.status.running": "В процессе, осталось %s секунд",
-  "text.observable.status.finished": "Анализ завершён. Пожалуйста, подождите..."
+  "text.observable.status.finished": "Анализ завершён. Пожалуйста, подождите...",
+  "text.observable.ae2_report_ready": "Отчёт AE2 готов. Скачать на этот клиент:",
+  "text.observable.ae2_report_download_html": "[Скачать HTML]",
+  "text.observable.ae2_report_download_json": "[Скачать JSON]",
+  "text.observable.ae2_report_download_hover": "Передать отчёт с сервера и сохранить его локально",
+  "text.observable.ae2_report_downloaded": "Отчёт AE2 сохранён локально: %s (нажми, чтобы открыть)",
+  "text.observable.ae2_report_save_failed": "Не удалось сохранить скачанный AE2-отчёт: %s",
+  "text.observable.ae2_report_player_only": "Скачивание AE2-отчётов доступно только игроку в игре",
+  "text.observable.ae2_report_unavailable": "Файл AE2-отчёта уже недоступен; запусти новый AE2-профиль"
 }

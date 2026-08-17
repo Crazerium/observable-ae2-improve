@@ -12,6 +12,8 @@ class S2CPacket {
 
     @Serializable data class ProfilingResult(val data: ProfilingData, val link: String?)
 
+    @Serializable data class AE2ReportFile(val fileName: String, val data: ByteArray)
+
     @Serializable
     enum class Availability {
         Available,

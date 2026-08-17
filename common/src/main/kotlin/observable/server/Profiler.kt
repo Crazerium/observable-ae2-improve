@@ -3,8 +3,12 @@ import dev.architectury.utils.GameInstance
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import net.minecraft.ChatFormatting
 import net.minecraft.core.BlockPos
 import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.network.chat.ClickEvent
+import net.minecraft.network.chat.Component
+import net.minecraft.network.chat.HoverEvent
 import net.minecraft.resources.ResourceKey
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.entity.Entity
@@ -13,16 +17,21 @@ import net.minecraft.world.level.block.entity.BlockEntity
 import net.minecraft.world.level.block.entity.TickingBlockEntity
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.material.FluidState
+import observable.CompatProfilerReport
 import observable.Observable
 import observable.Props
 import observable.net.S2CPacket
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.file.Files
+import java.nio.file.Path
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.GZIPOutputStream
 import kotlin.concurrent.schedule
 import kotlin.random.Random
+private const val MAX_COMPAT_REPORT_DOWNLOAD_BYTES = 16 * 1024 * 1024
+
 inline val StackTraceElement.classMethod
     get() = "${this.className} + ${this.methodName}"
 
@@ -51,6 +60,10 @@ class Profiler {
     var startTime: Long = 0
     var startingTicks: Int = 0
     @Volatile var lastCompletedTicks: Int = 0
+
+    private data class CompatReportFiles(val jsonFile: Path?, val htmlFile: Path?)
+
+    private val compatReportsByPlayer = ConcurrentHashMap<UUID, CompatReportFiles>()
     fun process(entity: Entity) =
         timingsMap.getOrPut(entity) { TimingData(0, 0, TraceMap(entity::class)) }
 
@@ -209,6 +222,93 @@ class Profiler {
             stopRunning()
         }
     }
+    private fun validCompatReportPath(path: Path?): Path? =
+        path?.takeIf {
+            try {
+                Files.isRegularFile(it)
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+    private fun reportDownloadButton(label: String, format: String): Component =
+        Component.literal(label)
+            .withStyle(ChatFormatting.AQUA, ChatFormatting.UNDERLINE)
+            .withStyle { style ->
+                style
+                    .withClickEvent(
+                        ClickEvent(
+                            ClickEvent.Action.RUN_COMMAND,
+                            "/observable ae2 download $format"
+                        )
+                    )
+                    .withHoverEvent(
+                        HoverEvent(
+                            HoverEvent.Action.SHOW_TEXT,
+                            Component.literal("Передать отчёт с сервера и сохранить его локально")
+                        )
+                    )
+            }
+
+    private fun rememberAndOfferCompatReport(player: ServerPlayer, report: CompatProfilerReport?) {
+        if (report == null) return
+
+        val jsonFile = validCompatReportPath(report.jsonFile)
+        val htmlFile = validCompatReportPath(report.htmlFile)
+        if (jsonFile == null && htmlFile == null) return
+
+        compatReportsByPlayer[player.uuid] = CompatReportFiles(jsonFile, htmlFile)
+        val playerId = player.uuid
+        GameInstance.getServer()?.execute {
+            val online = GameInstance.getServer()?.playerList?.getPlayer(playerId) ?: return@execute
+            val message = Component.literal("AE2-отчёт готов. Скачать на этот клиент:")
+            if (htmlFile != null) {
+                message.append(" ").append(
+                    reportDownloadButton("[Скачать HTML]", "html")
+                )
+            }
+            if (jsonFile != null) {
+                message.append(" ").append(
+                    reportDownloadButton("[Скачать JSON]", "json")
+                )
+            }
+            online.sendSystemMessage(message)
+        }
+    }
+
+    fun sendCompatReport(player: ServerPlayer, format: String): Boolean {
+        val report = compatReportsByPlayer[player.uuid] ?: return false
+        val path = when (format.lowercase(Locale.ROOT)) {
+            "html" -> report.htmlFile
+            "json" -> report.jsonFile
+            else -> null
+        } ?: return false
+
+        return try {
+            if (!Files.isRegularFile(path)) return false
+            val size = Files.size(path)
+            if (size <= 0L || size > MAX_COMPAT_REPORT_DOWNLOAD_BYTES) {
+                Observable.LOGGER.warn(
+                    "Refusing AE2 report download ${path.fileName}: ${size} bytes"
+                )
+                return false
+            }
+
+            val bytes = Files.readAllBytes(path)
+            Observable.CHANNEL.sendToPlayersSplit(
+                listOf(player),
+                S2CPacket.AE2ReportFile(path.fileName.toString(), bytes)
+            )
+            Observable.LOGGER.info(
+                "Sent AE2 report ${path.fileName} (${bytes.size} bytes) to ${player.gameProfile.name}"
+            )
+            true
+        } catch (t: Throwable) {
+            Observable.LOGGER.warn("Failed to send AE2 report $path to ${player.gameProfile.name}", t)
+            false
+        }
+    }
+
     /**
      * ProfilingData stores an average rate as time / sample-count. Compatibility
      * collectors may intentionally create a zero-cost bucket (for example an
@@ -270,6 +370,7 @@ class Profiler {
     }
     fun stopRunning() {
         val diagnostics = getDiagnostics()
+        val initiatingPlayer = player
         val ticks: Int
         synchronized(Props.notProcessing) {
             notProcessing = true
@@ -279,9 +380,10 @@ class Profiler {
         val compatEnabled = Props.compatProfilerEnabled
         // Freeze optional compatibility collectors before ProfilingData snapshots
         // the maps. Regular Observable runs skip this entire path.
+        var compatReport: CompatProfilerReport? = null
         if (compatEnabled) {
             try {
-                Props.compatProfilerSnapshotHook?.run()
+                compatReport = Props.compatProfilerSnapshotHook?.get()
             } catch (t: Throwable) {
                 Observable.LOGGER.warn("Compatibility profiler snapshot hook failed", t)
             } finally {
@@ -291,7 +393,7 @@ class Profiler {
                 Props.compatProfilerEnabled = false
             }
         }
-        val players = player?.let { listOf(it) } ?: listOf()
+        val players = initiatingPlayer?.let { listOf(it) } ?: listOf()
         Observable.CHANNEL.sendToPlayers(players, S2CPacket.ProfilingCompleted)
         // Snapshot the normal profile plus the bounded Top-N AE2 markers (when
         // explicitly requested) for observable.tas.sh upload. Before
@@ -324,6 +426,9 @@ class Profiler {
 
         val clientData = ProfilingData.create(timingsMap, blockTimingsMap, ticks, serverTraceMap)
         Observable.CHANNEL.sendToPlayersSplit(players, S2CPacket.ProfilingResult(clientData, link))
+        if (compatEnabled && initiatingPlayer != null) {
+            rememberAndOfferCompatReport(initiatingPlayer, compatReport)
+        }
         Observable.LOGGER.info("Data transfer complete!")
         GameInstance.getServer()
             ?.playerList

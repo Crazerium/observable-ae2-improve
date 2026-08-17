@@ -122,6 +122,22 @@ object Observable {
             }
         }
 
+        CHANNEL.register { t: S2CPacket.AE2ReportFile, _ ->
+            try {
+                val link = ProfileExporter.exportAE2Report(t.fileName, t.data)
+                CLIENT_CHAT.addMessage(
+                    Component.literal("AE2-отчёт сохранён локально: ")
+                        .append(link)
+                        .append(" (нажми, чтобы открыть)")
+                )
+            } catch (e: Exception) {
+                LOGGER.warn("Failed to save downloaded AE2 report ${t.fileName}", e)
+                CLIENT_CHAT.addMessage(
+                    Component.literal("Не удалось сохранить скачанный AE2-отчёт: ${t.fileName}")
+                )
+            }
+        }
+
         CHANNEL.register { t: S2CPacket.Availability, _ ->
             when (t) {
                 S2CPacket.Availability.Available -> {

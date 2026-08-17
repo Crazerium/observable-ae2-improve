@@ -31,5 +31,13 @@
   "text.observable.maxEntityDist": "Max entity label distance (blocks):",
   "text.observable.normalize": "Normalize results:",
   "text.observable.maxEntityCount": "Max # of entities:",
-  "text.observable.cmd": "Observable is a server-side entity profiler that can help you figure out what's lagging your server. To learn more, go to %s."
+  "text.observable.cmd": "Observable is a server-side entity profiler that can help you figure out what's lagging your server. To learn more, go to %s.",
+  "text.observable.ae2_report_ready": "AE2 report is ready. Download to this client:",
+  "text.observable.ae2_report_download_html": "[Download HTML]",
+  "text.observable.ae2_report_download_json": "[Download JSON]",
+  "text.observable.ae2_report_download_hover": "Transfer this report from the server and save it locally",
+  "text.observable.ae2_report_downloaded": "AE2 report saved locally: %s (click to open)",
+  "text.observable.ae2_report_save_failed": "Could not save downloaded AE2 report: %s",
+  "text.observable.ae2_report_player_only": "AE2 report downloads are available only to an in-game player",
+  "text.observable.ae2_report_unavailable": "That AE2 report file is no longer available; run a new AE2 profile"
 }

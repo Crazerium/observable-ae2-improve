@@ -3,6 +3,7 @@ package observable;
 import observable.server.Profiler;
 
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public class Props {
     public static volatile boolean notProcessing = true;
@@ -13,7 +14,7 @@ public class Props {
     // to reset and snapshot AE2 grid-wide metrics at exactly the same boundaries
     // as Observable's own profiling session.
     public static volatile Runnable compatProfilerStartHook = null;
-    public static volatile Runnable compatProfilerSnapshotHook = null;
+    public static volatile Supplier<CompatProfilerReport> compatProfilerSnapshotHook = null;
     // Runs after the full profile has been saved/uploaded, just before the
     // result packet is built for the in-game client. Compat layers can use
     // this to collapse diagnostic-only virtual markers without removing them

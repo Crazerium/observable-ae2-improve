@@ -19,6 +19,20 @@ import observable.util.MOD_URL_COMPONENT
 private const val DEFAULT_AE2_GRID_LIMIT = 128
 private const val MAX_AE2_GRID_LIMIT = 2048
 
+private fun downloadAe2Report(ctx: CommandContext<CommandSourceStack>, format: String): Int {
+    val player = ctx.source.player
+    if (player == null) {
+        ctx.source.sendFailure(Component.literal("Скачивание AE2-отчётов доступно только игроку в игре"))
+        return 0
+    }
+
+    if (!Observable.PROFILER.sendCompatReport(player, format)) {
+        ctx.source.sendFailure(Component.literal("Файл AE2-отчёта уже недоступен; запусти новый AE2-профиль"))
+        return 0
+    }
+    return 1
+}
+
 private fun runAe2Profiler(ctx: CommandContext<CommandSourceStack>, duration: Int, gridLimit: Int): Int {
     if (!Observable.PROFILER.notProcessing) {
         ctx.source.sendFailure(Component.literal("Observable profiler is already running"))
@@ -70,6 +84,19 @@ val OBSERVABLE_COMMAND
             )
             .then(
                 Commands.literal("ae2")
+                    .then(
+                        Commands.literal("download")
+                            .then(
+                                Commands.literal("html").executes { ctx ->
+                                    downloadAe2Report(ctx, "html")
+                                }
+                            )
+                            .then(
+                                Commands.literal("json").executes { ctx ->
+                                    downloadAe2Report(ctx, "json")
+                                }
+                            )
+                    )
                     .then(
                         Commands.literal("run")
                             .then(
